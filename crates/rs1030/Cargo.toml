@@ -1,0 +1,12 @@
+[package]
+name = "rs1030"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+deku.workspace = true
+desperado.workspace = true
+num-complex.workspace = true
+serde.workspace = true

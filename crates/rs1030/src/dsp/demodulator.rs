@@ -1,11 +1,7 @@
 use num_complex::Complex32;
 
-pub const DEFAULT_SAMPLE_RATE: f64 = 20.0e6;
-pub const BIT_RATE: f64 = 4.0e6;
-pub const SAMPLES_PER_BIT: usize = 5;
-pub const P6_OFFSET_SAMPLES: usize = 70;
-pub const P6_SYNC_SAMPLES: usize = 25;
-pub const P6_DATA_OFFSET_SAMPLES: usize = P6_SYNC_SAMPLES + 2 * SAMPLES_PER_BIT;
+use super::timing::UplinkTiming;
+
 pub const SHORT_BITS: usize = 56;
 pub const LONG_BITS: usize = 112;
 
@@ -30,22 +26,43 @@ impl std::fmt::Display for DemodError {
 
 impl std::error::Error for DemodError {}
 
-/// Demodulate a snippet whose P1 starts at sample 0 and whose P6 starts at sample 70.
+/// Demodulate a 20 MS/s snippet whose P1 starts at sample 0.
 pub fn demodulate_snippet(iq: &[Complex32]) -> Result<Vec<u8>, DemodError> {
-    let num_bits =
-        if iq.len() >= P6_OFFSET_SAMPLES + P6_DATA_OFFSET_SAMPLES + LONG_BITS * SAMPLES_PER_BIT {
-            LONG_BITS
-        } else {
-            SHORT_BITS
-        };
-    demodulate_from_p6(&iq[P6_OFFSET_SAMPLES..], num_bits)
+    demodulate_snippet_with_timing(iq, &UplinkTiming::default())
 }
 
-/// DPSK demodulate a detected frame inside a larger buffer.
+pub fn demodulate_snippet_with_timing(
+    iq: &[Complex32],
+    timing: &UplinkTiming,
+) -> Result<Vec<u8>, DemodError> {
+    let num_bits = if iq.len() >= timing.min_samples_long() {
+        LONG_BITS
+    } else {
+        SHORT_BITS
+    };
+    if iq.len() < timing.p6_offset_samples {
+        return Err(DemodError::NotEnoughSamples {
+            needed: timing.p6_offset_samples,
+            got: iq.len(),
+        });
+    }
+    demodulate_from_p6_with_timing(&iq[timing.p6_offset_samples..], num_bits, timing)
+}
+
+/// DPSK demodulate a detected frame inside a larger buffer using default 20 MS/s timing.
 pub fn demodulate_detection(
     iq: &[Complex32],
     p6_sample: usize,
     num_bits: usize,
+) -> Result<Vec<u8>, DemodError> {
+    demodulate_detection_with_timing(iq, p6_sample, num_bits, &UplinkTiming::default())
+}
+
+pub fn demodulate_detection_with_timing(
+    iq: &[Complex32],
+    p6_sample: usize,
+    num_bits: usize,
+    timing: &UplinkTiming,
 ) -> Result<Vec<u8>, DemodError> {
     if p6_sample > iq.len() {
         return Err(DemodError::NotEnoughSamples {
@@ -53,15 +70,23 @@ pub fn demodulate_detection(
             got: iq.len(),
         });
     }
-    demodulate_from_p6(&iq[p6_sample..], num_bits)
+    demodulate_from_p6_with_timing(&iq[p6_sample..], num_bits, timing)
 }
 
-/// DPSK demodulate samples starting at the beginning of P6.
+/// DPSK demodulate samples starting at the beginning of P6 using default 20 MS/s timing.
 pub fn demodulate_from_p6(iq: &[Complex32], num_bits: usize) -> Result<Vec<u8>, DemodError> {
+    demodulate_from_p6_with_timing(iq, num_bits, &UplinkTiming::default())
+}
+
+pub fn demodulate_from_p6_with_timing(
+    iq: &[Complex32],
+    num_bits: usize,
+    timing: &UplinkTiming,
+) -> Result<Vec<u8>, DemodError> {
     if num_bits != SHORT_BITS && num_bits != LONG_BITS {
         return Err(DemodError::UnsupportedBitLength(num_bits));
     }
-    let required = P6_DATA_OFFSET_SAMPLES + num_bits * SAMPLES_PER_BIT;
+    let required = timing.p6_data_offset_samples + num_bits * timing.samples_per_bit;
     if iq.len() < required {
         return Err(DemodError::NotEnoughSamples {
             needed: required,
@@ -71,10 +96,10 @@ pub fn demodulate_from_p6(iq: &[Complex32], num_bits: usize) -> Result<Vec<u8>, 
 
     let mut out = vec![0u8; num_bits / 8];
     for n in 0..num_bits {
-        let bit_start = P6_DATA_OFFSET_SAMPLES + n * SAMPLES_PER_BIT;
+        let bit_start = timing.p6_data_offset_samples + n * timing.samples_per_bit;
         let mut sum = Complex32::new(0.0, 0.0);
-        for s in 0..SAMPLES_PER_BIT {
-            sum += iq[bit_start + s] * iq[bit_start + s - SAMPLES_PER_BIT].conj();
+        for s in 0..timing.samples_per_bit {
+            sum += iq[bit_start + s] * iq[bit_start + s - timing.samples_per_bit].conj();
         }
         if sum.re < 0.0 {
             let byte_index = n / 8;

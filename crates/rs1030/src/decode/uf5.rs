@@ -7,6 +7,7 @@
 //!
 //! - ICAO Annex 10, Vol. IV, Figure 3-7: uplink format summary.
 //! - ICAO Annex 10, Vol. IV, §3.1.2.6.3: surveillance identity request, UF5.
+//! - ICAO Annex 10, Vol. IV, §3.1.2.6.1.2: `RR` and queried BDS rules.
 //!
 //! | Bits | Field | Size | Meaning |
 //! | ---: | --- | ---: | --- |
@@ -20,6 +21,9 @@
 use deku::prelude::*;
 use serde::Serialize;
 
+use crate::decode::util::{queried_bds, BdsCode};
+use crate::decode::util::SpecialDesignator;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 pub struct Uf5 {
     #[deku(bits = "5")]
@@ -28,27 +32,31 @@ pub struct Uf5 {
     pub uf: u8,
 
     #[deku(bits = "3")]
-    /// Protocol control, Annex bits 6-8.
+    /// `PC`, protocol control, Annex bits 6-8.
     pub pc: u8,
 
     #[deku(bits = "5")]
-    /// Reply request, Annex bits 9-13.
+    /// `RR`, reply request, Annex bits 9-13.
     ///
     /// `0..=15` requests DF5 surveillance reply; `16..=31` requests DF21
-    /// Comm-B identity reply.
+    /// Comm-B identity reply and defines `BDS1` through the low nibble.
     pub rr: u8,
 
     #[deku(bits = "3")]
-    /// Designator identification, Annex bits 14-16. Defines the `SD` structure.
+    /// `DI`, designator identification, Annex bits 14-16. Dispatches `SD`.
     pub di: u8,
 
-    #[deku(bits = "16", endian = "big")]
-    /// Special designator, Annex bits 17-32.
-    pub sd: u16,
+    #[deku(ctx = "*di")]
+    /// `SD`, special designator, Annex bits 17-32, decoded according to `DI`.
+    pub sd: SpecialDesignator,
+
+    #[deku(skip, default = "queried_bds(*rr, &sd)")]
+    /// Queried Comm-B register when `RR >= 16`; serialized as hexadecimal.
+    pub bds: Option<BdsCode>,
 
     #[deku(bits = "24", endian = "big")]
     #[serde(skip)]
-    /// Raw address/parity field, Annex bits 33-56.
+    /// Raw `AP`, address/parity overlay field, Annex bits 33-56.
     pub ap: u32,
 }
 
@@ -68,7 +76,7 @@ mod tests {
         assert_eq!(parsed.pc, 0);
         assert_eq!(parsed.rr, 0);
         assert_eq!(parsed.di, 0);
-        assert_eq!(parsed.sd, 0);
+        assert_eq!(parsed.bds, None);
         assert_eq!(parsed.ap, 0x123456);
     }
 }

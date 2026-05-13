@@ -9,6 +9,7 @@
 //! - ICAO Annex 10, Vol. IV, §3.1.2.3: Mode S data encoding and AP parity.
 //! - ICAO Annex 10, Vol. IV, Figure 3-7: uplink format summary.
 
+pub mod util;
 pub mod uf0;
 pub mod uf11;
 pub mod uf16;

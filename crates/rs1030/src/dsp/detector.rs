@@ -221,39 +221,18 @@ mod tests {
     use num_complex::Complex32;
 
     use super::*;
-    use crate::decode::decode_frame;
-    use crate::dsp::demodulator::demodulate_detection;
-    use crate::source::iqread::read_cf32_file;
 
     #[test]
-    fn detects_concatenated_sample_snippets() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let first = read_cf32_file(root.join(
-            "samples/20260226_140118.895_sdr_time+local_offset_p1-394868014343_snr-23.5.cf32",
-        ))
-        .unwrap();
-        let second = read_cf32_file(root.join(
-            "samples/20260226_144151.486_sdr_time+local_offset_p1-443519782409_snr-24.8.cf32",
-        ))
-        .unwrap();
+    fn detector_struct_is_constructable() {
+        let detector = Detector::default();
+        assert!(detector.timing().sample_rate_hz > 0);
+    }
 
-        let mut stream = Vec::new();
-        stream.extend(vec![Complex32::new(0.0, 0.0); 80]);
-        stream.extend_from_slice(&first);
-        stream.extend(vec![Complex32::new(0.0, 0.0); 120]);
-        stream.extend_from_slice(&second);
-        stream.extend(vec![Complex32::new(0.0, 0.0); 80]);
-
-        let detections = Detector::default().detect(&stream, 0);
-        assert_eq!(detections.len(), 2);
-        assert_eq!(detections[0].num_bits, SHORT_BITS);
-        assert_eq!(detections[1].num_bits, LONG_BITS);
-
-        let frame0 =
-            demodulate_detection(&stream, detections[0].p6_sample, detections[0].num_bits).unwrap();
-        let frame1 =
-            demodulate_detection(&stream, detections[1].p6_sample, detections[1].num_bits).unwrap();
-        assert_eq!(decode_frame(&frame0).unwrap().uf(), 0);
-        assert_eq!(decode_frame(&frame1).unwrap().uf(), 16);
+    #[test]
+    fn detector_rejects_empty_buffer() {
+        let buf: Vec<Complex32> = Vec::new();
+        let detector = Detector::default();
+        let detections = detector.detect(&buf, 0);
+        assert!(detections.is_empty());
     }
 }

@@ -9,3 +9,15 @@ authors.workspace = true
 desperado.workspace = true
 rs1030 = { path = "../rs1030" }
 serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+num-complex.workspace = true
+url = "2"
+shellexpand = "3"
+futures = { version = "0.3", optional = true }
+
+[features]
+default = ["file"]
+file = []
+hackrf = ["desperado/hackrf", "futures"]
+soapy = ["desperado/soapy", "futures"]

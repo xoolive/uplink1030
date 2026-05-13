@@ -7,6 +7,5 @@ authors.workspace = true
 
 [dependencies]
 deku.workspace = true
-desperado.workspace = true
 num-complex.workspace = true
 serde.workspace = true

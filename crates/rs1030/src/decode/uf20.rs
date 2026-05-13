@@ -22,11 +22,12 @@
 use deku::prelude::*;
 use serde::Serialize;
 
-use crate::decode::util::{queried_bds, BdsCode};
 use crate::decode::util::Ma;
 use crate::decode::util::SpecialDesignator;
+use crate::decode::util::{queried_bds, BdsCode, Icao24};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
+#[deku(ctx = "icao24: u32")]
 pub struct Uf20 {
     #[deku(bits = "5")]
     #[serde(skip)]
@@ -56,15 +57,16 @@ pub struct Uf20 {
     /// `MA`, 56-bit Comm-A message field, Annex bits 33-88.
     pub ma: Ma,
 
-    #[deku(bits = "24", endian = "big")]
-    #[serde(skip)]
-    /// Raw `AP`, address/parity overlay field, Annex bits 89-112.
-    pub ap: u32,
+    #[serde(rename = "icao24")]
+    #[deku(ctx = "icao24")]
+    /// Recovered address from the `AP` address/parity overlay, Annex bits 89-112.
+    pub ap: Icao24,
 }
 
-pub fn decode(frame: &[u8]) -> Result<Uf20, DekuError> {
-    let (_, parsed) = Uf20::from_bytes((frame, 0))?;
-    Ok(parsed)
+pub fn decode(frame: &[u8], icao24: u32) -> Result<Uf20, DekuError> {
+    let mut cursor = deku::no_std_io::Cursor::new(frame);
+    let reader = &mut deku::reader::Reader::new(&mut cursor);
+    Uf20::from_reader_with_ctx(reader, icao24)
 }
 
 #[cfg(test)]
@@ -75,9 +77,9 @@ mod tests {
         let frame = [
             0xa0, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 0x12, 0x34, 0x56,
         ];
-        let parsed = decode(&frame).unwrap();
+        let parsed = decode(&frame, 0xabcdef).unwrap();
         assert_eq!(parsed.uf, 20);
-        assert_eq!(parsed.ap, 0x123456);
+        assert_eq!(parsed.ap.0, 0xabcdef);
         assert!(matches!(parsed.ma, Ma::DifferentialGpsCorrection { .. }));
     }
 
@@ -86,7 +88,7 @@ mod tests {
         let frame = [
             0xa0, 0x90, 0x00, 0x00, 0x05, 0xa0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56,
         ];
-        let parsed = decode(&frame).unwrap();
+        let parsed = decode(&frame, 0xabcdef).unwrap();
         assert_eq!(parsed.bds, Some(BdsCode(0x20)));
     }
 }

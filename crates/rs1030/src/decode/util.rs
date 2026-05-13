@@ -19,8 +19,64 @@
 //! - DO-181E Appendix C, Table C-2-3: uplink broadcast identifiers.
 //! - DO-181E §2.2.22.1.1: TCAS sensitivity level command `ADS`/`SLC` fields.
 
+use std::fmt;
+
 use deku::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Recovered 24-bit address from an uplink `AP` address/parity field.
+///
+/// This mirrors `jet1090`'s `IcaoParity`: the raw 24 parity bits are consumed
+/// from the frame, but the stored value comes from decoder context. For 1030 MHz
+/// uplink, that context is computed by removing the Mode S CRC contribution and
+/// inverting the uplink AP overlay transform.
+#[derive(PartialEq, Eq, PartialOrd, DekuRead, Hash, Copy, Clone, Ord)]
+#[deku(ctx = "address: u32")]
+pub struct Icao24(
+    /// Six-hex-digit Mode S address recovered from the `AP` overlay.
+    #[deku(bits = "24", map = "|_v: u32| -> Result<_, DekuError> { Ok(address) }")]
+    pub u32,
+);
+
+impl fmt::Debug for Icao24 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:06x}", self.0)
+    }
+}
+
+impl fmt::Display for Icao24 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:06x}", self.0)
+    }
+}
+
+impl Serialize for Icao24 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{:06x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Icao24 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        <Icao24 as core::str::FromStr>::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl core::str::FromStr for Icao24 {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let num = u32::from_str_radix(s, 16)?;
+        Ok(Self(num))
+    }
+}
 
 // -----------------------------------------------------------------------------
 // SD: special designator

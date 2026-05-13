@@ -2,14 +2,15 @@
 //!
 //! Format-specific decoders are organized by uplink format (`uf0.rs`,
 //! `uf16.rs`, etc.). This module dispatches based on the `UF` field and adds
-//! common metadata such as raw frame hex and recovered AP-overlay address.
+//! common metadata such as raw frame hex. Recovered AP-overlay addresses are
+//! decoded inside the UF payloads, mirroring `jet1090`'s DF-specific
+//! `IcaoParity` handling.
 //!
 //! Primary references:
 //!
 //! - ICAO Annex 10, Vol. IV, §3.1.2.3: Mode S data encoding and AP parity.
 //! - ICAO Annex 10, Vol. IV, Figure 3-7: uplink format summary.
 
-pub mod util;
 pub mod uf0;
 pub mod uf11;
 pub mod uf16;
@@ -18,6 +19,7 @@ pub mod uf21;
 pub mod uf24;
 pub mod uf4;
 pub mod uf5;
+pub mod util;
 
 use deku::{ctx::Order, prelude::*};
 use serde::Serialize;
@@ -78,17 +80,17 @@ impl UplinkFormat {
         }
     }
 
-    fn from_frame(frame: &[u8]) -> Result<Self, DekuError> {
+    fn from_frame(frame: &[u8], icao24: u32) -> Result<Self, DekuError> {
         let first_five = frame[0] >> 3;
         match first_five {
-            0 => Ok(Self::Uf0(uf0::decode(frame)?)),
-            4 => Ok(Self::Uf4(uf4::decode(frame)?)),
-            5 => Ok(Self::Uf5(uf5::decode(frame)?)),
-            11 => Ok(Self::Uf11(uf11::decode(frame)?)),
-            16 => Ok(Self::Uf16(uf16::decode(frame)?)),
-            20 => Ok(Self::Uf20(uf20::decode(frame)?)),
-            21 => Ok(Self::Uf21(uf21::decode(frame)?)),
-            _ if (frame[0] & 0xC0) == 0xC0 => Ok(Self::Uf24(uf24::decode(frame)?)),
+            0 => Ok(Self::Uf0(uf0::decode(frame, icao24)?)),
+            4 => Ok(Self::Uf4(uf4::decode(frame, icao24)?)),
+            5 => Ok(Self::Uf5(uf5::decode(frame, icao24)?)),
+            11 => Ok(Self::Uf11(uf11::decode(frame, icao24)?)),
+            16 => Ok(Self::Uf16(uf16::decode(frame, icao24)?)),
+            20 => Ok(Self::Uf20(uf20::decode(frame, icao24)?)),
+            21 => Ok(Self::Uf21(uf21::decode(frame, icao24)?)),
+            _ if (frame[0] & 0xC0) == 0xC0 => Ok(Self::Uf24(uf24::decode(frame, icao24)?)),
             other => Ok(Self::Unknown { uf: other }),
         }
     }
@@ -166,7 +168,8 @@ impl DekuReader<'_> for UplinkFormat {
                 .into_vec();
             frame.extend_from_slice(&rest);
         }
-        Self::from_frame(&frame)
+        let icao24 = recover_ap_address(&frame, bit_len);
+        Self::from_frame(&frame, icao24)
     }
 }
 
@@ -174,9 +177,6 @@ impl DekuReader<'_> for UplinkFormat {
 pub struct DecodedUplink {
     /// Raw demodulated frame in hexadecimal.
     pub raw: String,
-
-    /// Recovered AP-overlay address formatted as six lowercase hex digits.
-    pub address: String,
 
     /// Decoded uplink payload, flattened in JSON.
     #[serde(flatten)]
@@ -218,12 +218,11 @@ pub fn decode_frame(frame: &[u8]) -> Result<DecodedUplink, DecodeError> {
         14 => 112,
         len => return Err(DecodeError::InvalidLength(len)),
     };
-    let payload = UplinkFormat::from_frame(frame)?;
-    let address_u32 = recover_ap_address(frame, bits);
+    let icao24 = recover_ap_address(frame, bits);
+    let payload = UplinkFormat::from_frame(frame, icao24)?;
 
     Ok(DecodedUplink {
         raw: bytes_to_hex(frame),
-        address: format!("{address_u32:06x}"),
         payload,
     })
 }
@@ -237,7 +236,10 @@ mod tests {
         let frame = [0x00, 0x00, 0x00, 0x00, 0x72, 0x19, 0x51];
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded.uf(), 0);
-        assert_eq!(decoded.address, "4b1618");
+        match decoded.payload {
+            UplinkFormat::Uf0(uf0) => assert_eq!(uf0.ap.0, 0x4b1618),
+            _ => panic!("wrong UF"),
+        }
     }
 
     #[test]

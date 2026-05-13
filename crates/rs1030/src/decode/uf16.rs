@@ -33,6 +33,8 @@
 use deku::prelude::*;
 use serde::Serialize;
 
+use crate::decode::util::Icao24;
+
 use crate::bits::extract_bits;
 
 /// High-level classification of the UF16 ACAS `MU` field.
@@ -94,12 +96,13 @@ pub struct AcasMu {
     ///
     /// Present for resolution messages and ACAS broadcasts. It occupies Annex
     /// bits 65-88 in the UF16 frame and is formatted as six lowercase
-    /// hexadecimal digits, like `DecodedUplink::address`.
+    /// hexadecimal digits, like the recovered `icao24` AP field.
     pub mid: Option<String>,
 }
 
 /// UF16 — long air-air surveillance interrogation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
+#[deku(ctx = "icao24: u32")]
 pub struct Uf16 {
     #[deku(bits = "5")]
     #[serde(skip)]
@@ -134,18 +137,20 @@ pub struct Uf16 {
     pub mu: [u8; 7],
 
     #[deku(skip, default = "decode_mu_bytes(&mu)")]
+    #[serde(flatten)]
     /// Human-readable ACAS `MU` classification and selected subfields.
     pub acas: AcasMu,
 
-    #[deku(bits = "24", endian = "big")]
-    #[serde(skip)]
-    /// Raw address/parity field, Annex bits 89-112.
-    pub ap: u32,
+    #[serde(rename = "icao24")]
+    #[deku(ctx = "icao24")]
+    /// Recovered address from the `AP` address/parity overlay, Annex bits 89-112.
+    pub ap: Icao24,
 }
 
-pub fn decode(frame: &[u8]) -> Result<Uf16, DekuError> {
-    let (_, parsed) = Uf16::from_bytes((frame, 0))?;
-    Ok(parsed)
+pub fn decode(frame: &[u8], icao24: u32) -> Result<Uf16, DekuError> {
+    let mut cursor = deku::no_std_io::Cursor::new(frame);
+    let reader = &mut deku::reader::Reader::new(&mut cursor);
+    Uf16::from_reader_with_ctx(reader, icao24)
 }
 
 fn decode_mu_bytes(mu: &[u8; 7]) -> AcasMu {
@@ -193,13 +198,13 @@ mod tests {
         let frame = [
             0x80, 0x80, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x4b, 0x18, 0x04, 0xd2, 0x3f, 0x7c,
         ];
-        let parsed = decode(&frame).unwrap();
+        let parsed = decode(&frame, 0xabcdef).unwrap();
         assert_eq!(parsed.uf, 16);
         assert!(parsed.rl);
         assert!(!parsed.aq);
         assert_eq!(parsed.mu, [0x32, 0x00, 0x00, 0x00, 0x4b, 0x18, 0x04]);
         assert_eq!(parsed.acas.kind, MuKind::AcasBroadcast);
         assert_eq!(parsed.acas.mid.as_deref(), Some("4b1804"));
-        assert_eq!(parsed.ap, 0xd23f7c);
+        assert_eq!(parsed.ap.0, 0xabcdef);
     }
 }

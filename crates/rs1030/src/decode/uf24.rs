@@ -21,7 +21,10 @@
 use deku::prelude::*;
 use serde::Serialize;
 
+use crate::decode::util::Icao24;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
+#[deku(ctx = "icao24: u32")]
 pub struct Uf24 {
     #[deku(bits = "2")]
     #[serde(skip)]
@@ -39,15 +42,16 @@ pub struct Uf24 {
     /// Comm-C message field, Annex bits 9-88.
     pub mc: [u8; 10],
 
-    #[deku(bits = "24", endian = "big")]
-    #[serde(skip)]
-    /// Raw address/parity field, Annex bits 89-112.
-    pub ap: u32,
+    #[serde(rename = "icao24")]
+    #[deku(ctx = "icao24")]
+    /// Recovered address from the `AP` address/parity overlay, Annex bits 89-112.
+    pub ap: Icao24,
 }
 
-pub fn decode(frame: &[u8]) -> Result<Uf24, DekuError> {
-    let (_, parsed) = Uf24::from_bytes((frame, 0))?;
-    Ok(parsed)
+pub fn decode(frame: &[u8], icao24: u32) -> Result<Uf24, DekuError> {
+    let mut cursor = deku::no_std_io::Cursor::new(frame);
+    let reader = &mut deku::reader::Reader::new(&mut cursor);
+    Uf24::from_reader_with_ctx(reader, icao24)
 }
 
 #[cfg(test)]
@@ -56,11 +60,11 @@ mod tests {
     #[test]
     fn parses_layout() {
         let frame = [0xc0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0x12, 0x34, 0x56];
-        let parsed = decode(&frame).unwrap();
+        let parsed = decode(&frame, 0xabcdef).unwrap();
         assert_eq!(parsed.uf_prefix, 3);
         assert_eq!(parsed.rc, 0);
         assert_eq!(parsed.nc, 0);
         assert_eq!(parsed.mc, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert_eq!(parsed.ap, 0x123456);
+        assert_eq!(parsed.ap.0, 0xabcdef);
     }
 }

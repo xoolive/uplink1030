@@ -84,6 +84,11 @@ impl RationalResampler {
         })
     }
 
+    /// Future input required by the centered FIR, in actual input samples.
+    pub fn input_lookahead(&self) -> usize {
+        HALF
+    }
+
     /// `final_chunk` declares EOF and flushes the bounded lookahead. Exactly
     /// ceil(N*out/in) samples are produced, each with a center before input EOF.
     /// Further input after EOF is a programming error.

@@ -9,11 +9,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 mod output;
 mod source;
+mod timestamps;
 use source::{Source, SourceError};
+use timestamps::{system_now, ArrivalClock, EventContext};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -266,14 +267,9 @@ async fn run() -> Result<(), SourceError> {
             .notch_offset_hz
             .map(|f| NotchFilter::new(f, source.sample_rate))
             .transpose()?;
-        let start = explicit_start.or(source.start_timestamp).or_else(|| {
-            source.is_live().then(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64()
-            })
-        });
+        let start = explicit_start
+            .or(source.start_timestamp)
+            .or_else(|| source.is_live().then(system_now));
         let basis = if explicit_start.is_some() {
             "sample_clock_explicit_start"
         } else if source.start_timestamp.is_some() {
@@ -284,6 +280,24 @@ async fn run() -> Result<(), SourceError> {
             "relative_samples_only"
         };
         let sample_rate = source.sample_rate;
+        // Retain anchors through frame lookahead, timing searches and centered
+        // FIR lookahead. Pruning happens after event emission, never before it.
+        let retain_input = ((timing.min_samples_long() + 32 * timing.samples_per_bit) as u128
+            * sample_rate as u128)
+            .div_ceil(decode_rate as u128) as usize
+            + 2 * resampler
+                .as_ref()
+                .map_or(0, RationalResampler::input_lookahead);
+        let mut context = EventContext {
+            source: spec,
+            input_rate: sample_rate,
+            decode_rate,
+            start,
+            basis,
+            arrivals: source
+                .is_live()
+                .then(|| ArrivalClock::new(sample_rate, retain_input)),
+        };
         let max_samples = args
             .seconds
             .map(|seconds| (seconds * sample_rate as f64) as usize);
@@ -303,6 +317,8 @@ async fn run() -> Result<(), SourceError> {
             );
         }
         source::for_each_sample_chunk(&source, |mut chunk| {
+            let arrival_time = system_now();
+            let read_len = chunk.len();
             if stopped.load(Ordering::Relaxed)
                 || !output.poll(spec, samples as f64 / sample_rate as f64, false)?
             {
@@ -311,6 +327,9 @@ async fn run() -> Result<(), SourceError> {
             }
             if let Some(max) = max_samples {
                 chunk.truncate(max.saturating_sub(samples));
+            }
+            if let Some(clock) = &mut context.arrivals {
+                clock.record(samples, read_len, chunk.len(), arrival_time);
             }
             if let Some(notch) = &mut notch {
                 notch.apply(&mut chunk);
@@ -326,7 +345,10 @@ async fn run() -> Result<(), SourceError> {
             };
             total_decoder_samples += decoding.len();
             for r in receiver.push(decoding, false) {
-                emit(&mut output, r, spec, sample_rate, decode_rate, start, basis)?;
+                emit(&mut output, r, &context)?;
+            }
+            if let Some(clock) = &mut context.arrivals {
+                clock.prune(samples);
             }
             Ok(max_samples.is_none_or(|max| samples < max))
         })
@@ -336,11 +358,11 @@ async fn run() -> Result<(), SourceError> {
                 let tail = resampler.push(&[], true);
                 total_decoder_samples += tail.len();
                 for r in receiver.push(&tail, false) {
-                    emit(&mut output, r, spec, sample_rate, decode_rate, start, basis)?;
+                    emit(&mut output, r, &context)?;
                 }
             }
             for r in receiver.push(&[], true) {
-                emit(&mut output, r, spec, sample_rate, decode_rate, start, basis)?;
+                emit(&mut output, r, &context)?;
             }
         }
         total_samples += samples;
@@ -371,25 +393,28 @@ async fn run() -> Result<(), SourceError> {
 fn emit(
     out: &mut output::Output,
     r: rs1030::dsp::receiver::Recovered,
-    spec: &str,
-    rate: u32,
-    decode_rate: u32,
-    start: Option<f64>,
-    basis: &str,
+    context: &EventContext<'_>,
 ) -> Result<(), SourceError> {
-    let seconds = r.detection.p6_sample as f64 / decode_rate as f64;
+    let seconds = r.detection.p6_sample as f64 / context.decode_rate as f64;
+    let reception = context.reception_time(r.detection.p6_sample);
     let mut value = serde_json::to_value(r)?;
-    value["source"] = spec.into();
-    value["sample_rate_hz"] = rate.into();
-    if decode_rate != rate {
-        value["decode_sample_rate_hz"] = decode_rate.into();
-        value["input_p6_sample"] = (seconds * rate as f64).into();
+    value["source"] = context.source.into();
+    value["sample_rate_hz"] = context.input_rate.into();
+    if context.decode_rate != context.input_rate {
+        value["decode_sample_rate_hz"] = context.decode_rate.into();
+        value["input_p6_sample"] = (seconds * context.input_rate as f64).into();
     }
     value["seconds"] = seconds.into();
-    value["timestamp"] = start
+    value["timestamp"] = context
+        .start
         .map(|s| serde_json::Value::from(s + seconds))
         .unwrap_or(serde_json::Value::Null);
-    value["timestamp_basis"] = basis.into();
+    value["timestamp_basis"] = context.basis.into();
+    value["system_timestamp"] = reception
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    value["system_timestamp_basis"] = context.reception_basis().into();
+    value["decoded_at"] = system_now().into();
     out.message(value)
 }
 

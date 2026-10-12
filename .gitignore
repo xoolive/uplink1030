@@ -1,2 +1,5 @@
 plan.md
 samples
+
+# Local analysis utilities are not part of the receiver project.
+/scripts/

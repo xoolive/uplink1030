@@ -95,7 +95,16 @@ fn known_list_annotates_unknowns_and_known_only_filters() {
     let blind = run(false, false);
     let annotated = run(true, false);
     assert!(blind.status.success() && annotated.status.success());
-    assert_eq!(blind.stdout, annotated.stdout);
+    let stable = |bytes: &[u8]| {
+        decoded(bytes)
+            .into_iter()
+            .map(|mut row| {
+                row.as_object_mut().unwrap().remove("decoded_at");
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stable(&blind.stdout), stable(&annotated.stdout));
     assert_query(&decoded(&annotated.stdout));
     assert!(decoded(&annotated.stdout)
         .iter()
@@ -190,6 +199,40 @@ fn fractional_input_rate_resamples_and_preserves_time_coordinates() {
     assert!(decoded(&automatic.stdout)
         .iter()
         .all(|r| r["decode_sample_rate_hz"] == 8_000_000));
+
+    // Short live input forces resampler/frame lookahead to flush at EOF. Its
+    // reception anchor must survive the flush and still use the input clock.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_uplink1030"))
+        .args(["-", "--sample-rate", "10M", "--center-freq", "1031M"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut short = Vec::new();
+    for _ in 0..2000 {
+        short.extend(0.08f32.to_le_bytes());
+        short.extend((-0.03f32).to_le_bytes());
+    }
+    short.extend(&std::fs::read(&file.0).unwrap()[..330 * 8]);
+    child.stdin.take().unwrap().write_all(&short).unwrap();
+    let live = child.wait_with_output().unwrap();
+    assert!(
+        live.status.success(),
+        "{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let rows = decoded(&live.stdout);
+    assert_query(&rows);
+    for row in rows {
+        assert_eq!(row["sample_rate_hz"], 10_000_000);
+        assert_eq!(row["decode_sample_rate_hz"], 8_000_000);
+        assert_eq!(
+            row["system_timestamp_basis"],
+            "host_chunk_arrival_approximate"
+        );
+        assert!(row["system_timestamp"].as_f64().unwrap() <= row["decoded_at"].as_f64().unwrap());
+    }
 }
 
 #[test]
@@ -228,6 +271,50 @@ fn compressed_file_and_stdin_share_native_pipeline() {
     assert_query(&decoded(&result.stdout));
 }
 #[test]
+fn recording_and_emission_timestamps_are_distinct() {
+    let file = Fixture::new("cf32");
+    std::fs::write(&file.0, waveform()).unwrap();
+    for dated in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_uplink1030"));
+        command
+            .arg(&file.0)
+            .args(["--sample-rate", "16M", "--center-freq", "1032M"]);
+        if dated {
+            command.args(["--start-time", "2026-10-06T10:57:07Z"]);
+        }
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let result = command.output().unwrap();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(result.status.success());
+        let rows = decoded(&result.stdout);
+        assert_query(&rows);
+        for row in rows {
+            let emitted = row["decoded_at"].as_f64().unwrap();
+            assert!(before <= emitted && emitted <= after);
+            assert_eq!(row["system_timestamp"], row["timestamp"]);
+            assert_eq!(row["system_timestamp_basis"], row["timestamp_basis"]);
+            if dated {
+                assert!(
+                    (row["timestamp"].as_f64().unwrap()
+                        - 1791284227.
+                        - row["seconds"].as_f64().unwrap())
+                    .abs()
+                        < 1e-6
+                );
+            } else {
+                assert!(row["system_timestamp"].is_null());
+            }
+        }
+    }
+}
+
+#[test]
 fn tcp_iq_and_output_file() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -248,8 +335,18 @@ fn tcp_iq_and_output_file() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_query(&decoded(&std::fs::read(&file.0).unwrap()));
-    assert_query(&decoded(&result.stdout));
+    let rows = decoded(&std::fs::read(&file.0).unwrap());
+    assert_query(&rows);
+    assert_eq!(rows, decoded(&result.stdout));
+    for row in rows {
+        assert_eq!(
+            row["system_timestamp_basis"],
+            "host_chunk_arrival_approximate"
+        );
+        let received = row["system_timestamp"].as_f64().unwrap();
+        let emitted = row["decoded_at"].as_f64().unwrap();
+        assert!(received <= emitted && emitted - received < 5., "{row}");
+    }
 }
 #[test]
 fn protects_whitelist_and_existing_output_on_tui_error() {

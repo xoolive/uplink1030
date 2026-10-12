@@ -58,7 +58,7 @@ impl UplinkTiming {
                 minimum_hz: MIN_UPLINK_SAMPLE_RATE_HZ,
             });
         }
-        if sample_rate_hz % BIT_RATE_HZ != 0 {
+        if !sample_rate_hz.is_multiple_of(BIT_RATE_HZ) {
             return Err(TimingError::NonIntegerSamplesPerBit {
                 sample_rate_hz,
                 bit_rate_hz: BIT_RATE_HZ,

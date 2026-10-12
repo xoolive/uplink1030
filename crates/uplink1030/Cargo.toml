@@ -1,5 +1,6 @@
 [package]
 name = "uplink1030"
+default-run = "uplink1030"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,10 +15,20 @@ clap = { version = "4", features = ["derive"] }
 num-complex.workspace = true
 url = "2"
 shellexpand = "3"
-futures = { version = "0.3", optional = true }
+zstd = "0.13"
+futures = "0.3"
+chrono = "0.4"
+percent-encoding = "2"
+crossterm = "0.29"
+ratatui = "0.30"
+# Desperado 0.4.1 uses the pre-0.4.2 RTL API (patch release changed it).
+rs-rtl = { version = "=0.4.1", optional = true }
 
 [features]
 default = ["file"]
 file = []
-hackrf = ["desperado/hackrf", "futures"]
-soapy = ["desperado/soapy", "futures"]
+hackrf = ["desperado/hackrf"]
+soapy = ["desperado/soapy"]
+airspy = ["desperado/airspy"]
+pluto = ["desperado/pluto"]
+rtlsdr = ["desperado/rtlsdr", "dep:rs-rtl"]

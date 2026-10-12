@@ -309,6 +309,11 @@ pub fn queried_bds(rr: u8, sd: &SpecialDesignator) -> Option<BdsCode> {
         _ => 0,
     };
 
+    // RR16 with no extended RRS requests an air-initiated Comm-B message,
+    // not a GICB register called BDS0,0. Nonzero RRS may address BDS0,x.
+    if rr == 16 && bds2 == 0 {
+        return None;
+    }
     Some(BdsCode((bds1 << 4) | bds2))
 }
 
@@ -321,6 +326,15 @@ mod bds_tests {
     fn no_bds_for_surveillance_request() {
         let sd = decode_sd(0, 0).unwrap();
         assert_eq!(queried_bds(0, &sd), None);
+    }
+
+    #[test]
+    fn air_initiated_comm_b_is_not_register_zero() {
+        assert_eq!(queried_bds(16, &decode_sd(1, 0x3040).unwrap()), None);
+        assert_eq!(
+            queried_bds(16, &decode_sd(3, 0x00a0).unwrap()),
+            Some(BdsCode(0x05))
+        );
     }
 
     #[test]

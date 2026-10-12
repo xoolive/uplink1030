@@ -64,10 +64,7 @@ impl Detector {
         // around P6, so a global-mean split can overestimate noise because most
         // samples belong to the interrogation. A lower-tail estimate works for
         // both snippets and longer streams with silence/noise gaps.
-        let mut sorted_mag = mag.clone();
-        sorted_mag.sort_by(|a, b| a.total_cmp(b));
-        let noise_count = (sorted_mag.len() / 5).max(1);
-        let mut noise = sorted_mag[..noise_count].iter().sum::<f32>() / noise_count as f32;
+        let mut noise = quiet_tail_mean(&mag);
         if noise < 1e-6 {
             noise = 1e-6;
         }
@@ -76,9 +73,14 @@ impl Detector {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + self.timing.min_samples_short() <= count {
+            // Most samples are not a threshold crossing. Reject those before
+            // summing the pulse window, without changing the original test.
+            if i != 0 && !(mag[i] > thresh && mag[i - 1] <= thresh) {
+                i += 1;
+                continue;
+            }
             let p1_avg = avg_mag(&mag, i, self.timing.p1_samples);
-            let rising_edge =
-                p1_avg > thresh && (i == 0 || (mag[i] > thresh && mag[i - 1] <= thresh));
+            let rising_edge = p1_avg > thresh;
             if !rising_edge {
                 i += 1;
                 continue;
@@ -176,6 +178,16 @@ impl Detector {
     }
 }
 
+/// Select just the quietest fifth, then sort that prefix to preserve the
+/// original ascending f32 accumulation order (and exact detector thresholds).
+fn quiet_tail_mean(mag: &[f32]) -> f32 {
+    let count = (mag.len() / 5).max(1);
+    let mut tail = mag.to_vec();
+    tail.select_nth_unstable_by(count - 1, f32::total_cmp);
+    tail[..count].sort_unstable_by(f32::total_cmp);
+    tail[..count].iter().sum::<f32>() / count as f32
+}
+
 fn fast_mag(c: Complex32) -> f32 {
     let re = c.re.abs();
     let im = c.im.abs();
@@ -226,6 +238,26 @@ mod tests {
     fn detector_struct_is_constructable() {
         let detector = Detector::default();
         assert!(detector.timing().sample_rate_hz > 0);
+    }
+
+    #[test]
+    fn selected_noise_tail_matches_full_sort_bit_for_bit() {
+        let mut seed = 0x12345678u32;
+        for len in [1, 2, 4, 5, 13, 1000, 65536] {
+            let values: Vec<_> = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed % 10007) as f32 / 8192.
+                })
+                .collect();
+            let mut reference = values.clone();
+            reference.sort_by(f32::total_cmp);
+            let count = (len / 5).max(1);
+            let expected = reference[..count].iter().sum::<f32>() / count as f32;
+            assert_eq!(quiet_tail_mean(&values).to_bits(), expected.to_bits());
+        }
     }
 
     #[test]

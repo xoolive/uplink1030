@@ -184,6 +184,22 @@ pub struct DecodedUplink {
 }
 
 impl DecodedUplink {
+    /// AP-recovered address, not an independent CRC validation. Reuses the
+    /// address already calculated during decoding; unsupported UFs lack it.
+    pub fn icao24(&self) -> Option<u32> {
+        match &self.payload {
+            UplinkFormat::Uf0(m) => Some(m.ap.0),
+            UplinkFormat::Uf4(m) => Some(m.ap.0),
+            UplinkFormat::Uf5(m) => Some(m.ap.0),
+            UplinkFormat::Uf11(m) => Some(m.ap.0),
+            UplinkFormat::Uf16(m) => Some(m.ap.0),
+            UplinkFormat::Uf20(m) => Some(m.ap.0),
+            UplinkFormat::Uf21(m) => Some(m.ap.0),
+            UplinkFormat::Uf24(m) => Some(m.ap.0),
+            UplinkFormat::Unknown { .. } => None,
+        }
+    }
+
     pub fn uf(&self) -> u8 {
         self.payload.number()
     }
@@ -192,6 +208,7 @@ impl DecodedUplink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     InvalidLength(usize),
+    UfLengthMismatch { uf: u8, bits: usize },
     Deku(DekuError),
 }
 
@@ -199,6 +216,9 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidLength(len) => write!(f, "invalid Mode S uplink byte length: {len}"),
+            Self::UfLengthMismatch { uf, bits } => {
+                write!(f, "UF{uf} is not valid in a {bits}-bit uplink frame")
+            }
             Self::Deku(err) => write!(f, "{err}"),
         }
     }
@@ -218,6 +238,20 @@ pub fn decode_frame(frame: &[u8]) -> Result<DecodedUplink, DecodeError> {
         14 => 112,
         len => return Err(DecodeError::InvalidLength(len)),
     };
+    let first_five = frame[0] >> 3;
+    let uf = if (frame[0] & 0xC0) == 0xC0 {
+        24
+    } else {
+        first_five
+    };
+    let expected_bits = match uf {
+        0 | 4 | 5 | 11 => Some(56),
+        16 | 20 | 21 | 24 => Some(112),
+        _ => None,
+    };
+    if expected_bits.is_some_and(|expected| expected != bits) {
+        return Err(DecodeError::UfLengthMismatch { uf, bits });
+    }
     let icao24 = recover_ap_address(frame, bits);
     let payload = UplinkFormat::from_frame(frame, icao24)?;
 
@@ -236,6 +270,7 @@ mod tests {
         let frame = [0x00, 0x00, 0x00, 0x00, 0x72, 0x19, 0x51];
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded.uf(), 0);
+        assert_eq!(decoded.icao24(), Some(0x4b1618));
         match decoded.payload {
             UplinkFormat::Uf0(uf0) => assert_eq!(uf0.ap.0, 0x4b1618),
             _ => panic!("wrong UF"),
@@ -255,8 +290,27 @@ mod tests {
         for (frame, expected_uf) in cases {
             let decoded = decode_frame(frame).unwrap();
             assert_eq!(decoded.uf(), *expected_uf);
+            assert_eq!(
+                decoded.icao24(),
+                Some(recover_ap_address(frame, frame.len() * 8))
+            );
             assert!(!matches!(decoded.payload, UplinkFormat::Unknown { .. }));
         }
+    }
+
+    #[test]
+    fn rejects_uf_length_mismatches() {
+        let short_uf20 = [0xa0, 0, 0, 0, 0x12, 0x34, 0x56];
+        assert!(matches!(
+            decode_frame(&short_uf20),
+            Err(DecodeError::UfLengthMismatch { uf: 20, bits: 56 })
+        ));
+
+        let long_uf0 = [0u8; 14];
+        assert!(matches!(
+            decode_frame(&long_uf0),
+            Err(DecodeError::UfLengthMismatch { uf: 0, bits: 112 })
+        ));
     }
 
     #[test]

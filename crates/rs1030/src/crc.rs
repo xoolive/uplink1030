@@ -45,7 +45,17 @@ pub fn recover_ap_address(msg: &[u8], n_bits: usize) -> u32 {
     let parity = ((msg[parity_start] as u32) << 16)
         | ((msg[parity_start + 1] as u32) << 8)
         | msg[parity_start + 2] as u32;
-    let crc = crc24(msg, n_bits - 24);
+    // Annex 10 Vol IV §3.1.2.3.3.1.2: parity is the remainder of
+    // x^24 M(x), not M(x). Append 24 zero bits before removing the AP overlay.
+    // Omitting this augmentation only happens to work for all-zero payloads.
+    let mut crc = crc24(msg, n_bits - 24);
+    for _ in 0..24 {
+        let msb = crc & 0x80_0000;
+        crc = (crc << 1) & 0xFF_FFFF;
+        if msb != 0 {
+            crc ^= CRC24_GENERATOR;
+        }
+    }
     ap_address_from_overlay(crc ^ parity)
 }
 
@@ -60,9 +70,9 @@ fn build_overlay_inverse() -> [u32; 24] {
 
     for i in 0..24 {
         let col = ap_overlay_from_address(1 << (23 - i));
-        for j in 0..24 {
+        for (j, row) in mat.iter_mut().enumerate() {
             if (col & (1 << (23 - j))) != 0 {
-                mat[j] |= 1 << (23 - i);
+                *row |= 1 << (23 - i);
             }
         }
     }
@@ -93,6 +103,18 @@ fn build_overlay_inverse() -> [u32; 24] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovers_nonzero_payload_addresses() {
+        // Golden parity computed by polynomial long division of x^24 M(x),
+        // XORed with the independently known overlay 0x7b7341 for 0x46c942.
+        let uf4 = [0x20, 0x90, 0, 0, 0xcc, 0x55, 0xa3];
+        assert_eq!(recover_ap_address(&uf4, 56), 0x46c942);
+        let uf20 = [
+            0xa0, 0x90, 0, 0, 0x05, 0xa0, 0, 0, 0, 0, 0, 0x02, 0x7c, 0xe5,
+        ];
+        assert_eq!(recover_ap_address(&uf20, 112), 0x46c942);
+    }
 
     #[test]
     fn overlay_round_trip() {

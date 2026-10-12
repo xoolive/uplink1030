@@ -21,8 +21,6 @@ chrono = "0.4"
 percent-encoding = "2"
 crossterm = "0.29"
 ratatui = "0.30"
-# Desperado 0.4.1 uses the pre-0.4.2 RTL API (patch release changed it).
-rs-rtl = { version = "=0.4.1", optional = true }
 
 [features]
 default = ["file"]
@@ -31,4 +29,3 @@ hackrf = ["desperado/hackrf"]
 soapy = ["desperado/soapy"]
 airspy = ["desperado/airspy"]
 pluto = ["desperado/pluto"]
-rtlsdr = ["desperado/rtlsdr", "dep:rs-rtl"]

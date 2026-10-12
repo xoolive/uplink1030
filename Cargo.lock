@@ -593,7 +593,6 @@ dependencies = [
  "num-complex",
  "pluto-sdr",
  "rs-hackrf",
- "rs-rtl 0.5.0",
  "rs-spy",
  "serde",
  "soapysdr",
@@ -1905,28 +1904,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rs-rtl"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be84df73cb8ac7ca491a77ee8fee322da3e9e75b0b05adfe7e56f7dcee53537c"
-dependencies = [
- "nusb",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "rs-rtl"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f64080cfcfce7cafd33c3a88630f86c2425be38db78efbd8d73f56f9decad101"
-dependencies = [
- "nusb",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "rs-spy"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,7 +2561,6 @@ dependencies = [
  "num-complex",
  "percent-encoding",
  "ratatui",
- "rs-rtl 0.4.1",
  "rs1030",
  "serde_json",
  "shellexpand",

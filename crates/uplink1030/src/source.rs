@@ -1,6 +1,5 @@
 //! Bounded IQ sources. Device URI configuration is delegated to Desperado.
 //! Files (including Zstandard), stdin and TCP accept CF32/CU8/CS8/CS16.
-use chrono::NaiveDateTime;
 use desperado::IqFormat;
 #[cfg(any(
     feature = "hackrf",
@@ -148,22 +147,29 @@ impl FromStr for Source {
 
 impl Source {
     fn set_file(&mut self, path: String) {
-        // GQRX records UTC, center frequency and sample rate in its filename.
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let parts: Vec<_> = name.split('_').collect();
-        if parts.len() >= 6 && parts[0] == "gqrx" && parts[5].starts_with("fc.") {
-            if let (Ok(freq), Ok(rate)) = (parts[3].parse::<u32>(), parts[4].parse::<u32>()) {
+        // Raw I/Q capture names (GQRX, rtl_sdr; `.zst` too) carry center
+        // frequency, sample rate and format; GQRX names also carry the UTC
+        // start time. Query parameters and CLI flags applied later override them.
+        use desperado::capture::{parse_capture_filename, CaptureConvention};
+        if let Some(meta) = parse_capture_filename(&path).filter(|meta| {
+            matches!(
+                meta.convention,
+                CaptureConvention::Gqrx | CaptureConvention::RtlSdr
+            )
+        }) {
+            if let Some(freq) = meta.center_freq_hz {
                 self.center_frequency = freq;
+            }
+            if let Some(rate) = meta.sample_rate_hz {
                 self.sample_rate = rate;
             }
-            if let Ok(date) =
-                NaiveDateTime::parse_from_str(&format!("{}{}", parts[1], parts[2]), "%Y%m%d%H%M%S")
-            {
-                self.start_timestamp = Some(date.and_utc().timestamp() as f64);
+            if let Some(format) = meta.format {
+                self.format = format;
             }
+            self.start_timestamp = meta
+                .start
+                .and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs_f64());
         }
         self.input = Input::File(path);
     }
@@ -389,6 +395,16 @@ mod tests {
         assert_eq!(source.sample_rate, 16_000_000);
         assert_eq!(source.center_frequency, 1_033_326_000);
         assert_eq!(source.start_timestamp, Some(1791284227.));
+        assert_eq!(source.format, IqFormat::Cf32);
+        let rtl: Source = "rtlsdr_1030000000_8000000_uplink.cu8".parse().unwrap();
+        assert_eq!(rtl.center_frequency, 1_030_000_000);
+        assert_eq!(rtl.sample_rate, 8_000_000);
+        assert_eq!(rtl.format, IqFormat::Cu8);
+        assert_eq!(rtl.start_timestamp, None);
+        let gqrx_cs16: Source = "gqrx_20261006_105707_1033326000_16000000_cs16.raw"
+            .parse()
+            .unwrap();
+        assert_eq!(gqrx_cs16.format, IqFormat::Cs16);
         let uri: Source = "file:///tmp/Mobile%20Documents/test.cf32?rate=8M"
             .parse()
             .unwrap();

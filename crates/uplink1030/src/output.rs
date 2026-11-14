@@ -1,6 +1,7 @@
 //! JSONL recording is independent of TUI filters and replay presentation.
 use crate::{
     activity::{Message, Model, Settings},
+    downlink::Downlink,
     redis::Publisher,
     source::SourceError,
     tui::{Action, Ui},
@@ -76,6 +77,7 @@ pub struct Output {
     writer: Option<Box<dyn Write>>,
     redis: Option<Publisher>,
     redis_waiting: bool,
+    downlink: Option<Downlink>,
     stopped: Arc<AtomicBool>,
     stdout_json: bool,
     pretty: bool,
@@ -111,6 +113,7 @@ impl Output {
             writer,
             redis: None,
             redis_waiting: false,
+            downlink: None,
             stopped: Arc::new(AtomicBool::new(false)),
             stdout_json: !interactive && !stats,
             pretty,
@@ -143,6 +146,9 @@ impl Output {
             }
         }
         Ok(result)
+    }
+    pub fn attach_downlink(&mut self, downlink: Downlink) {
+        self.downlink = Some(downlink);
     }
     pub fn attach_redis(&mut self, publisher: Option<Publisher>, stopped: Arc<AtomicBool>) {
         self.redis = publisher;
@@ -221,7 +227,10 @@ impl Output {
             self.model.advance(time);
         }
     }
-    pub fn message(&mut self, value: Value) -> Result<(), SourceError> {
+    pub fn message(&mut self, mut value: Value) -> Result<(), SourceError> {
+        if let (Some(downlink), Value::Object(event)) = (&mut self.downlink, &mut value) {
+            downlink.annotate(event);
+        }
         let parsed = if self.track_activity {
             Some(
                 Message::parse(value.clone())
@@ -296,6 +305,10 @@ impl Output {
                 "REPLAY"
             } else {
                 "RECEIVE"
+            };
+            let mode = match &self.downlink {
+                Some(downlink) => format!("{mode} · {}", downlink.summary(self.model.now)),
+                None => mode.to_owned(),
             };
             let filename = std::path::Path::new(source)
                 .file_name()

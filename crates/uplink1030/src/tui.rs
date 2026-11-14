@@ -91,14 +91,22 @@ impl Ui {
                         .filter_map(|e| e.code.as_deref())
                         .collect::<BTreeSet<_>>();
                     let last = a.latest.as_ref();
+                    let heard = last.is_some_and(|m| m.value["seen_1090"].as_bool() == Some(true));
                     let mut c = vec![
-                        key.clone(),
+                        format!("{key}{}", if heard { " ✓" } else { "" }),
                         age,
                         count.to_string(),
                         format!("{:.2}", count as f64 / model.denominator()),
                         codes.into_iter().collect::<Vec<_>>().join(","),
                         last.map(|m| m.uf.to_string()).unwrap_or_default(),
                     ];
+                    if width >= 90 {
+                        c.push(
+                            last.and_then(|m| m.value["callsign"].as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                    }
                     if width >= 70 {
                         c.push(last.and_then(|m| m.bds.clone()).unwrap_or_default());
                         c.push(
@@ -365,7 +373,7 @@ impl Ui {
                 area.height.saturating_sub(2),
             );
             frame.render_widget(Clear, rect);
-            frame.render_widget(Paragraph::new("Tab: focus radar / aircraft panel\n↑ ↓ Home End: select and scroll; selection follows identity\nEnter / d: toggle details; PgUp/PgDn: scroll details\n/: edit shared address/code/site filter; Enter accepts; Esc clears\ns: toggle focused panel's recent / rolling-count sort\nf: toggle aircraft filter for selected radar; Esc clears\nReplay: Space pause, +/- speed, r restart\nq / Ctrl-C: quit; Esc closes detail/filter before quitting\n\nRates and targets use the trailing capture-time window.\nTargets are candidate addresses, not independently verified aircraft.\n~ scan = candidate estimate; ? = mixed / single-target ambiguity.\nNo estimate means insufficient same-target recurrence.\nRadar code reuse and missed rotations can mix scan estimates.\nCatalogue site names are hypotheses, not verified assignments.\nDisplay filters never change JSON recording.").wrap(Wrap{trim:false}).block(Block::bordered().title("Help")),rect);
+            frame.render_widget(Paragraph::new("Tab: focus radar / aircraft panel\n↑ ↓ Home End: select and scroll; selection follows identity\nEnter / d: toggle details; PgUp/PgDn: scroll details\n/: edit shared address/code/site filter; Enter accepts; Esc clears\ns: toggle focused panel's recent / rolling-count sort\nf: toggle aircraft filter for selected radar; Esc clears\nReplay: Space pause, +/- speed, r restart\nq / Ctrl-C: quit; Esc closes detail/filter before quitting\n\nRates and targets use the trailing capture-time window.\nTargets are candidate addresses, not independently verified aircraft.\n✓ = address heard on 1090 (--downlink / --downlink-redis) before the interrogation.\n~ scan = candidate estimate; ? = mixed / single-target ambiguity.\nNo estimate means insufficient same-target recurrence.\nRadar code reuse and missed rotations can mix scan estimates.\nCatalogue site names are hypotheses, not verified assignments.\nDisplay filters never change JSON recording.").wrap(Wrap{trim:false}).block(Block::bordered().title("Help")),rect);
         }
     }
     fn table(
@@ -399,13 +407,17 @@ impl Ui {
         let (headers, widths) = if aircraft {
             let mut h = vec!["ICAO24", "Age/s", "Count", "Msg/s", "Codes", "UF"];
             let mut w = vec![
-                Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Length(6),
                 Constraint::Length(5),
                 Constraint::Length(7),
                 Constraint::Min(6),
                 Constraint::Length(3),
             ];
+            if rect.width >= 90 {
+                h.push("Callsign");
+                w.push(Constraint::Length(8));
+            }
             if rect.width >= 70 {
                 h.extend(["BDS", "dB"]);
                 w.extend([Constraint::Length(3), Constraint::Length(6)]);
@@ -430,9 +442,23 @@ impl Ui {
         };
         let focus = self.aircraft_focus == aircraft;
         let title = if aircraft {
+            let heard = model
+                .aircraft
+                .values()
+                .filter(|a| {
+                    a.latest
+                        .as_ref()
+                        .is_some_and(|m| m.value["seen_1090"].as_bool() == Some(true))
+                })
+                .count();
             format!(
-                "Aircraft candidates {}{}",
+                "Aircraft candidates {}{}{}",
                 rows.len(),
+                if heard > 0 {
+                    format!(" | {heard} ✓ heard on 1090")
+                } else {
+                    String::new()
+                },
                 self.radar_filter
                     .as_ref()
                     .map(|s| format!(" | FILTER {s}"))
@@ -552,6 +578,44 @@ mod tests {
         assert_eq!(beta, alpha + 1);
         ui.query = "beta".into();
         assert_eq!(ui.rows(&model, false, 80, &names).len(), 1);
+    }
+    #[test]
+    fn aircraft_heard_on_1090_are_marked_with_their_callsign() {
+        let mut model = Model::new(Settings::default());
+        model.ingest(Message::parse(json!({"timestamp":100.,"uf":"4","icao24":"4ca242","interrogator":"II3","frame":"20970000b1c8a9","seen_1090":true,"seen_1090_age":3.2,"callsign":"RYR67RW"})).unwrap());
+        model.ingest(Message::parse(json!({"timestamp":100.5,"uf":"4","icao24":"abcdef","interrogator":"II3","frame":"20970000b1c8a9","seen_1090":false})).unwrap());
+        assert_eq!(
+            model.aircraft["4ca242"].latest.as_ref().unwrap().known,
+            Some(true)
+        );
+        assert_eq!(
+            model.aircraft["abcdef"].latest.as_ref().unwrap().known,
+            Some(false)
+        );
+        let mut ui = Ui::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                ui.draw(
+                    f,
+                    &model,
+                    "REPLAY · 1090 1 aircraft",
+                    &|_| String::new(),
+                    &|_| vec![],
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("4ca242 ✓"));
+        assert!(content.contains("RYR67RW"));
+        assert!(content.contains("1 ✓ heard on 1090"));
+        assert!(content.contains("1090 1 aircraft"));
     }
     #[test]
     fn code_search_and_explicit_radar_link_keep_aircraft_visible() {

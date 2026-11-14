@@ -73,9 +73,16 @@ impl Message {
             .as_str()
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        if !value["known"].is_null() && !value["known"].is_boolean() {
-            return Err("known must be boolean when present".into());
+        for key in ["known", "seen_1090"] {
+            if !value[key].is_null() && !value[key].is_boolean() {
+                return Err(format!("{key} must be boolean when present"));
+            }
         }
+        // Heard on 1090 is independent evidence, like a known-aircraft list.
+        let known = match (value["known"].as_bool(), value["seen_1090"].as_bool()) {
+            (None, None) => None,
+            (k, s) => Some(k.unwrap_or(false) || s.unwrap_or(false)),
+        };
         // Airborne ACAS has no ground interrogator identity, even if an input is enriched incorrectly.
         Ok(Self {
             time,
@@ -83,7 +90,7 @@ impl Message {
             address,
             code: if uf == 0 { None } else { code },
             bds,
-            known: value["known"].as_bool(),
+            known,
             value,
         })
     }
@@ -456,6 +463,20 @@ impl Model {
                 crate::schema::observation(&m.value, "confidence"),
                 crate::schema::observation(&m.value, "rssi")
             ));
+            if m.value["seen_1090"].as_bool() == Some(true) {
+                lines.push(format!(
+                    "1090: heard {}s before{}",
+                    m.value["seen_1090_age"]
+                        .as_f64()
+                        .map_or("?".into(), |a| format!("{a:.1}")),
+                    m.value["callsign"]
+                        .as_str()
+                        .map(|c| format!(" | callsign {c}"))
+                        .unwrap_or_default()
+                ));
+            } else if m.value["seen_1090"].as_bool() == Some(false) {
+                lines.push("1090: not heard (candidate address, possibly a decoding error)".into());
+            }
             lines.push(format!(
                 "Frame: {}",
                 m.value["frame"].as_str().unwrap_or("")

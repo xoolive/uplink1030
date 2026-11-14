@@ -12,6 +12,7 @@ use std::{
 };
 mod activity;
 mod catalogue;
+mod downlink;
 mod output;
 mod redis;
 mod replay;
@@ -119,6 +120,20 @@ struct Args {
     /// Notch an interferer at this offset from the original recording center.
     #[arg(long, allow_hyphen_values = true)]
     notch_offset_hz: Option<f32>,
+    /// Recorded jet1090 JSONL (.jsonl or .jsonl.zst) read in step with the
+    /// uplink capture clock: annotates events with what 1090 heard before them.
+    #[arg(long, value_name = "PATH", conflicts_with = "downlink_redis")]
+    downlink: Option<String>,
+    /// Subscribe to jet1090 on Redis (e.g. redis://localhost:6379) to annotate
+    /// events with what 1090 heard before them; never filters events.
+    #[arg(long, value_name = "URL")]
+    downlink_redis: Option<String>,
+    /// Redis pub/sub topic of jet1090.
+    #[arg(long, default_value = "jet1090", requires = "downlink_redis")]
+    downlink_topic: String,
+    /// An address counts as heard on 1090 for this many seconds.
+    #[arg(long, default_value = "120")]
+    downlink_ttl: f64,
     /// Add demodulator diagnostics to each JSON message (sample position,
     /// detection method, symbol/sync quality, noise, emission time).
     #[arg(long)]
@@ -193,7 +208,28 @@ async fn open_output(args: &Args, stopped: Arc<AtomicBool>) -> Result<output::Ou
         args.pretty,
         args.stats,
     )?;
-    output.attach_redis(publisher, stopped);
+    output.attach_redis(publisher, stopped.clone());
+    if !args.downlink_ttl.is_finite() || args.downlink_ttl <= 0. {
+        return Err("--downlink-ttl must be positive".into());
+    }
+    if let Some(path) = &args.downlink {
+        let path = shellexpand::tilde(path).into_owned();
+        if args
+            .output
+            .as_ref()
+            .is_some_and(|out| same_file(&path, out))
+        {
+            return Err("output path would overwrite the downlink recording".into());
+        }
+        output.attach_downlink(downlink::Downlink::from_file(&path, args.downlink_ttl)?);
+    } else if let Some(url) = &args.downlink_redis {
+        output.attach_downlink(downlink::Downlink::from_redis(
+            url,
+            args.downlink_topic.clone(),
+            args.downlink_ttl,
+            stopped,
+        )?);
+    }
     Ok(output)
 }
 

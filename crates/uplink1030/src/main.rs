@@ -122,14 +122,12 @@ struct Args {
     notch_offset_hz: Option<f32>,
     /// Recorded jet1090 JSONL (.jsonl or .jsonl.zst) read in step with the
     /// uplink capture clock: annotates events with what 1090 heard before them.
-    #[arg(long, value_name = "PATH", conflicts_with = "downlink_redis")]
+    /// With a live source and --redis-url, jet1090 is followed on Redis instead.
+    #[arg(long, value_name = "PATH")]
     downlink: Option<String>,
-    /// Subscribe to jet1090 on Redis (e.g. redis://localhost:6379) to annotate
-    /// events with what 1090 heard before them; never filters events.
-    #[arg(long, value_name = "URL")]
-    downlink_redis: Option<String>,
-    /// Redis pub/sub topic of jet1090.
-    #[arg(long, default_value = "jet1090", requires = "downlink_redis")]
+    /// jet1090's topic on the --redis-url server, followed with live sources
+    /// to annotate events with what 1090 heard before them (never filters).
+    #[arg(long, default_value = "jet1090", requires = "redis_url")]
     downlink_topic: String,
     /// An address counts as heard on 1090 for this many seconds.
     #[arg(long, default_value = "120")]
@@ -192,7 +190,13 @@ fn same_file(a: &str, b: &str) -> bool {
     false
 }
 
-async fn open_output(args: &Args, stopped: Arc<AtomicBool>) -> Result<output::Output, SourceError> {
+/// `live`: the source runs in real time, so the jet1090 feed on the same
+/// Redis server describes the same moments; recordings use --downlink instead.
+async fn open_output(
+    args: &Args,
+    stopped: Arc<AtomicBool>,
+    live: bool,
+) -> Result<output::Output, SourceError> {
     let publisher = if let Some(url) = &args.redis_url {
         Some(tokio::select! {
             biased;
@@ -222,7 +226,7 @@ async fn open_output(args: &Args, stopped: Arc<AtomicBool>) -> Result<output::Ou
             return Err("output path would overwrite the downlink recording".into());
         }
         output.attach_downlink(downlink::Downlink::from_file(&path, args.downlink_ttl)?);
-    } else if let Some(url) = &args.downlink_redis {
+    } else if let Some(url) = args.redis_url.as_ref().filter(|_| live) {
         output.attach_downlink(downlink::Downlink::from_redis(
             url,
             args.downlink_topic.clone(),
@@ -273,7 +277,7 @@ async fn run() -> Result<(), SourceError> {
         }
         // Validate input readability and its first event before creating/truncating output.
         replay::Reader::open(&path)?.next()?;
-        let mut output = open_output(&args, stopped.clone()).await?;
+        let mut output = open_output(&args, stopped.clone(), false).await?;
         output.configure(settings, sites, true, args.speed);
         replay::run(&path, &mut output, &stopped)?;
         let summary = serde_json::json!({"replay":path,"decoded_messages":output.decoded,"uf_counts":output.counts,"active_radar_codes":output.model.radars.len(),"active_aircraft_candidates":output.model.aircraft.len(),"unattributed_messages":output.model.unattributed,"addressed_messages_are_candidates":true});
@@ -349,7 +353,10 @@ async fn run() -> Result<(), SourceError> {
             }
         }
     }
-    let mut output = open_output(&args, stopped.clone()).await?;
+    let live = specs
+        .iter()
+        .any(|spec| spec.parse::<Source>().is_ok_and(|s| s.is_live()));
+    let mut output = open_output(&args, stopped.clone(), live).await?;
     output.configure(settings, sites, false, 1.);
     let mut total_samples = 0usize;
     let mut total_decoder_samples = 0usize;

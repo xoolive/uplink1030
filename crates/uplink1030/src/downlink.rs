@@ -215,16 +215,15 @@ impl Downlink {
         })
     }
 
-    /// Subscribes to jet1090 on Redis in the background, reconnecting after
-    /// failures. Decoding never waits on it.
+    /// Subscribes to jet1090 on Redis (the --redis-url server) in the
+    /// background, reconnecting after failures. Decoding never waits on it.
     pub fn from_redis(
         url: &str,
         topic: String,
         ttl: f64,
         stopped: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let client =
-            ::redis::Client::open(url).map_err(|e| format!("Invalid downlink Redis URL: {e}"))?;
+        let client = ::redis::Client::open(url).map_err(|e| format!("Invalid Redis URL: {e}"))?;
         let state: Arc<Mutex<State>> = Arc::default();
         let shared = state.clone();
         tokio::spawn(async move {

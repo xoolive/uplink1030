@@ -21,7 +21,7 @@
 use deku::prelude::*;
 use serde::Serialize;
 
-use crate::decode::util::Icao24;
+use crate::decode::util::{Icao24, Interrogator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(ctx = "icao24: u32")]
@@ -36,12 +36,18 @@ pub struct Uf11 {
     pub pr: u8,
 
     #[deku(bits = "4")]
+    #[serde(skip)]
     /// Interrogator code, Annex bits 10-13.
     pub ic: u8,
 
     #[deku(bits = "3")]
+    #[serde(skip)]
     /// Code label, Annex bits 14-16. Defines how `IC` is interpreted.
     pub cl: u8,
+
+    #[deku(skip, default = "Interrogator::from_ic_cl(*ic, *cl)")]
+    /// `IC` interpreted through `CL`, e.g. `"II3"` or `"SI36"`.
+    pub interrogator: Interrogator,
 
     #[deku(bits = "16", endian = "big")]
     #[serde(skip)]

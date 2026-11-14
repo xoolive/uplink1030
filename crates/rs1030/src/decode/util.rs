@@ -84,7 +84,7 @@ impl core::str::FromStr for Icao24 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(ctx = "di: u8", id = "di")]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum SpecialDesignator {
     /// `DI = 0`: II-code interrogator identifier plus overlay control.
     #[deku(id = "0")]
@@ -109,10 +109,13 @@ pub enum SpecialDesignator {
     /// `DI = 4, 5, 6`: reserved by Annex 10; retain the uninterpreted bits.
     #[deku(id_pat = "_")]
     Reserved {
-        /// `DI` value that selected this reserved structure.
+        /// `DI` value that selected this reserved structure (already
+        /// serialized by the enclosing UF as `di`).
+        #[serde(skip)]
         di: u8,
-        /// Raw 16-bit `SD` field, Annex bits 17-32.
+        /// Raw 16-bit `SD` field, Annex bits 17-32, serialized as `sd`.
         #[deku(bits = "16", endian = "big")]
+        #[serde(rename = "sd", serialize_with = "serialize_hex_u16")]
         bits: u16,
     },
 }
@@ -121,10 +124,12 @@ pub enum SpecialDesignator {
 pub struct SdDi0 {
     /// `IIS`, interrogator identifier subfield, Annex bits 17-20.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub iis: u8,
 
     /// Reserved bits 21-27, retained for diagnostics.
     #[deku(bits = "7")]
+    #[serde(skip)]
     pub reserved_21_27: u8,
 
     /// `OVC`, overlay control, Annex bit 28.
@@ -133,6 +138,7 @@ pub struct SdDi0 {
 
     /// Reserved bits 29-32, retained for diagnostics.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub reserved_29_32: u8,
 }
 
@@ -140,6 +146,7 @@ pub struct SdDi0 {
 pub struct SdDi1 {
     /// `IIS`, interrogator identifier subfield, Annex bits 17-20.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub iis: u8,
 
     /// `MBS`, multisite Comm-B subfield, Annex bits 21-22.
@@ -174,6 +181,7 @@ impl SdDi1 {
 pub struct SdDi2 {
     /// Reserved bits 17-20.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub reserved_17_20: u8,
 
     /// `TCS`, type control subfield, Annex bits 21-23.
@@ -190,6 +198,7 @@ pub struct SdDi2 {
 
     /// Reserved bits 29-32.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub reserved_29_32: u8,
 }
 
@@ -197,6 +206,7 @@ pub struct SdDi2 {
 pub struct SdDi3 {
     /// `SIS`, surveillance identifier subfield, Annex bits 17-22.
     #[deku(bits = "6")]
+    #[serde(skip)]
     pub sis: u8,
 
     /// `LSS`, lockout surveillance subfield, Annex bit 23.
@@ -213,6 +223,7 @@ pub struct SdDi3 {
 
     /// Reserved bits 29-32.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub reserved_29_32: u8,
 }
 
@@ -220,6 +231,7 @@ pub struct SdDi3 {
 pub struct SdDi7 {
     /// `IIS`, interrogator identifier subfield, Annex bits 17-20.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub iis: u8,
 
     /// `RRS`, reply request subfield carrying BDS2, Annex bits 21-24.
@@ -228,6 +240,7 @@ pub struct SdDi7 {
 
     /// Reserved bit 25.
     #[deku(bits = "1")]
+    #[serde(skip)]
     pub reserved_25: bool,
 
     /// `LOS`, lockout subfield, Annex bit 26.
@@ -236,6 +249,7 @@ pub struct SdDi7 {
 
     /// Reserved bit 27.
     #[deku(bits = "1")]
+    #[serde(skip)]
     pub reserved_27: bool,
 
     /// `OVC`, overlay control, Annex bit 28.
@@ -251,6 +265,110 @@ impl SdDi7 {
     /// `LAS`, linked Comm-A subfield, DO-181E Appendix C bits 30-32.
     pub fn las(&self) -> u8 {
         self.tms & 0x07
+    }
+}
+
+impl SpecialDesignator {
+    /// Interrogator identified by the `SD` field: `IIS` (DI 0, 1, 7) or
+    /// `SIS` (DI 3). DI 2 and reserved DIs carry no identifier.
+    pub fn interrogator(&self) -> Option<Interrogator> {
+        match self {
+            Self::Di0(sd) => Some(Interrogator::II(sd.iis)),
+            Self::Di1(sd) => Some(Interrogator::II(sd.iis)),
+            Self::Di7(sd) => Some(Interrogator::II(sd.iis)),
+            Self::Di3(sd) => Some(Interrogator::SI(sd.sis)),
+            Self::Di2(_) | Self::Reserved { .. } => None,
+        }
+    }
+}
+
+fn serialize_hex_u16<S>(value: &u16, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("{value:04x}"))
+}
+
+/// Hex string for a fixed-size byte field such as `MA`, `MC` or `MU`.
+pub fn serialize_hex_bytes<S, const N: usize>(
+    value: &[u8; N],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&crate::bits::bytes_to_hex(value))
+}
+
+// -----------------------------------------------------------------------------
+// Interrogator identifier
+// -----------------------------------------------------------------------------
+
+/// Interrogator code, serialized as one flat string shared with jet1090's
+/// DF11 `interrogator`:
+///
+/// - `"II0"`..`"II15"`: interrogator identifier (II code).
+/// - `"SI1"`..`"SI63"`: surveillance identifier (SI code).
+/// - `"SI0"`: the encoding of SI0, which is **not** an allocated SI code.
+///   Kept literal rather than folded into `"invalid"` so that it can be counted.
+/// - `"invalid"`: the field cannot be interpreted as II or SI (UF11 `CL` 5-7).
+///
+/// Sources: UF11 `IC`/`CL` (Annex 10 IV §3.1.2.5.2.1.3-4); UF4/5/20/21
+/// `SD/IIS` for DI 0, 1, 7 and `SD/SIS` for DI 3 (§3.1.2.6.1.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrogator {
+    II(u8),
+    SI(u8),
+    Invalid,
+}
+
+impl Interrogator {
+    /// UF11 `IC` interpreted through `CL`: CL 0 is II, CL 1-4 select the
+    /// SI block (CL-1)*16 + IC, CL 5-7 are not assigned.
+    pub fn from_ic_cl(ic: u8, cl: u8) -> Self {
+        match cl {
+            0 => Self::II(ic),
+            1..=4 => Self::SI((cl - 1) * 16 + ic),
+            _ => Self::Invalid,
+        }
+    }
+}
+
+impl fmt::Display for Interrogator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::II(code) => write!(f, "II{code}"),
+            Self::SI(code) => write!(f, "SI{code}"),
+            Self::Invalid => write!(f, "invalid"),
+        }
+    }
+}
+
+impl Serialize for Interrogator {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+#[cfg(test)]
+mod interrogator_tests {
+    use super::*;
+
+    #[test]
+    fn flat_strings() {
+        assert_eq!(Interrogator::from_ic_cl(7, 0).to_string(), "II7");
+        assert_eq!(Interrogator::from_ic_cl(4, 3).to_string(), "SI36");
+        assert_eq!(Interrogator::from_ic_cl(0, 1).to_string(), "SI0");
+        assert_eq!(Interrogator::from_ic_cl(15, 4).to_string(), "SI63");
+        assert_eq!(Interrogator::from_ic_cl(1, 5).to_string(), "invalid");
+        assert_eq!(
+            decode_sd(3, 36 << 10).unwrap().interrogator(),
+            Some(Interrogator::SI(36))
+        );
+        assert_eq!(decode_sd(2, 0).unwrap().interrogator(), None);
     }
 }
 
@@ -293,7 +411,8 @@ impl Serialize for BdsCode {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&format!("0x{:02x}", self.0))
+        // Same convention as jet1090: two lowercase hex digits, no prefix.
+        serializer.serialize_str(&format!("{:02x}", self.0))
     }
 }
 
@@ -357,7 +476,7 @@ mod bds_tests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(id_type = "u8")]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "comm_a", rename_all = "snake_case")]
 pub enum Ma {
     /// TIS uplink message, MSP channel 2 / header `0x02`.
     #[deku(id = "0x02")]
@@ -369,21 +488,33 @@ pub enum Ma {
 
     /// Differential GPS correction broadcast, uplink broadcast identifier `0x01`.
     #[deku(id = "0x01")]
-    DifferentialGpsCorrection { payload: [u8; 6] },
+    DifferentialGpsCorrection {
+        #[serde(skip)]
+        payload: [u8; 6],
+    },
 
     /// TCAS/ACAS RA broadcast placeholder, uplink broadcast identifier `0x31`.
     #[deku(id = "0x31")]
-    TcasRaBroadcast { payload: [u8; 6] },
+    TcasRaBroadcast {
+        #[serde(skip)]
+        payload: [u8; 6],
+    },
 
     /// TCAS/ACAS broadcast placeholder, uplink broadcast identifier `0x32`.
     #[deku(id = "0x32")]
-    AcasBroadcast { payload: [u8; 6] },
+    AcasBroadcast {
+        #[serde(skip)]
+        payload: [u8; 6],
+    },
 
     /// Unknown or not-yet-decoded Comm-A message. `id` is the first MA byte.
     #[deku(id_pat = "_")]
+    ///
+    /// Only `comm_a: "unknown"` is serialized: the bytes are in the `ma` hex.
     Unknown {
-        #[serde(serialize_with = "serialize_hex_u8")]
+        #[serde(skip)]
         id: u8,
+        #[serde(skip)]
         payload: [u8; 6],
     },
 }
@@ -396,7 +527,16 @@ pub struct TisUplink {
 
     /// Interpreted TIS message kind derived from `message_type`.
     #[deku(skip, default = "TisMessageKind::from_message_type(*message_type)")]
+    #[serde(rename = "tis_kind")]
     pub kind: TisMessageKind,
+
+    /// Own heading in degrees, first traffic segments only (`message_type` × 6).
+    #[deku(
+        skip,
+        default = "(*message_type < 60).then(|| *message_type as u16 * 6)"
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_heading_degrees: Option<u16>,
 
     /// First 21-bit TIS traffic information block, Doc 9871 §A.3.2.2.2.3.
     pub block1: TisTrafficBlock,
@@ -405,8 +545,7 @@ pub struct TisUplink {
     pub block2: TisTrafficBlock,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TisMessageKind {
     /// Traffic data first segment; value carries own heading in 6 degree steps.
     TrafficDataFirstSegment { own_heading_degrees: u16 },
@@ -418,6 +557,22 @@ pub enum TisMessageKind {
     Goodbye,
     /// TIS keep-alive message, message type 63.
     KeepAlive,
+}
+
+/// Flat snake_case string; the heading is exported as `own_heading_degrees`.
+impl Serialize for TisMessageKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::TrafficDataFirstSegment { .. } => "traffic_data_first_segment",
+            Self::TrafficDataIntermediateSegment => "traffic_data_intermediate_segment",
+            Self::TrafficDataFinalSegment => "traffic_data_final_segment",
+            Self::Goodbye => "goodbye",
+            Self::KeepAlive => "keep_alive",
+        })
+    }
 }
 
 impl TisMessageKind {
@@ -476,17 +631,24 @@ pub struct TcasSensitivityLevelCommand {
 
     /// Remaining low nibble of the second MA byte, retained until fully specified.
     #[deku(bits = "4")]
+    #[serde(skip)]
     pub reserved_45_48: u8,
 
     /// Remaining bytes of the 56-bit `MA` field after `ADS=0x05` and `SLC`.
+    /// Not serialized: available in the `ma` hex.
+    #[serde(skip)]
     pub payload: [u8; 5],
 }
 
-fn serialize_hex_u8<S>(value: &u8, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&format!("0x{value:02x}"))
+/// Decode the 56-bit `MA` field. Every header byte has a variant (unknown
+/// ones included), so seven bytes always parse.
+pub fn decode_ma(ma: &[u8; 7]) -> Ma {
+    Ma::from_bytes((ma, 0))
+        .map(|(_, decoded)| decoded)
+        .unwrap_or(Ma::Unknown {
+            id: ma[0],
+            payload: ma[1..].try_into().unwrap(),
+        })
 }
 
 #[cfg(test)]

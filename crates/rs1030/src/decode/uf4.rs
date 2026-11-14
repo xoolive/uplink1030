@@ -22,7 +22,7 @@ use deku::prelude::*;
 use serde::Serialize;
 
 use crate::decode::util::SpecialDesignator;
-use crate::decode::util::{queried_bds, BdsCode, Icao24};
+use crate::decode::util::{queried_bds, BdsCode, Icao24, Interrogator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(ctx = "icao24: u32")]
@@ -48,11 +48,19 @@ pub struct Uf4 {
     pub di: u8,
 
     #[deku(ctx = "*di")]
+    #[serde(flatten)]
     /// `SD`, special designator, Annex bits 17-32, decoded according to `DI`.
+    /// Its subfields are flattened; `IIS`/`SIS` appear as `interrogator`.
     pub sd: SpecialDesignator,
 
+    #[deku(skip, default = "sd.interrogator()")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Interrogator from `SD/IIS` (DI 0, 1, 7) or `SD/SIS` (DI 3), e.g. `"II7"`.
+    pub interrogator: Option<Interrogator>,
+
     #[deku(skip, default = "queried_bds(*rr, &sd)")]
-    /// Queried Comm-B register when `RR >= 16`; serialized as hexadecimal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Queried Comm-B register when `RR >= 16`; serialized as two hex digits.
     pub bds: Option<BdsCode>,
 
     #[serde(rename = "icao24")]

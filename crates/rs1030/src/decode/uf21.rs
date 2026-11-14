@@ -22,9 +22,9 @@
 use deku::prelude::*;
 use serde::Serialize;
 
-use crate::decode::util::Ma;
 use crate::decode::util::SpecialDesignator;
-use crate::decode::util::{queried_bds, BdsCode, Icao24};
+use crate::decode::util::{decode_ma, serialize_hex_bytes, Ma};
+use crate::decode::util::{queried_bds, BdsCode, Icao24, Interrogator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(ctx = "icao24: u32")]
@@ -47,15 +47,29 @@ pub struct Uf21 {
     pub di: u8,
 
     #[deku(ctx = "*di")]
+    #[serde(flatten)]
     /// `SD`, special designator, Annex bits 17-32, decoded according to `DI`.
+    /// Its subfields are flattened; `IIS`/`SIS` appear as `interrogator`.
     pub sd: SpecialDesignator,
 
+    #[deku(skip, default = "sd.interrogator()")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Interrogator from `SD/IIS` (DI 0, 1, 7) or `SD/SIS` (DI 3), e.g. `"II7"`.
+    pub interrogator: Option<Interrogator>,
+
     #[deku(skip, default = "queried_bds(*rr, &sd)")]
-    /// Queried Comm-B register when `RR >= 16`; serialized as hexadecimal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Queried Comm-B register when `RR >= 16`; serialized as two hex digits.
     pub bds: Option<BdsCode>,
 
-    /// `MA`, 56-bit Comm-A message field, Annex bits 33-88.
-    pub ma: Ma,
+    /// `MA`, 56-bit Comm-A message field, Annex bits 33-88, as hex.
+    #[serde(serialize_with = "serialize_hex_bytes")]
+    pub ma: [u8; 7],
+
+    #[deku(skip, default = "decode_ma(ma)")]
+    #[serde(flatten)]
+    /// Decoded `MA`: `comm_a` names the message type, plus its fields.
+    pub comm_a: Ma,
 
     #[serde(rename = "icao24")]
     #[deku(ctx = "icao24")]
@@ -80,6 +94,9 @@ mod tests {
         let parsed = decode(&frame, 0xabcdef).unwrap();
         assert_eq!(parsed.uf, 21);
         assert_eq!(parsed.ap.0, 0xabcdef);
-        assert!(matches!(parsed.ma, Ma::DifferentialGpsCorrection { .. }));
+        assert!(matches!(
+            parsed.comm_a,
+            Ma::DifferentialGpsCorrection { .. }
+        ));
     }
 }

@@ -42,27 +42,44 @@ use crate::decode::uf5::Uf5;
 /// two bits `11`, while other formats use a conventional five-bit UF value.
 ///
 /// Reference: ICAO Annex 10, Vol. IV, §3.1.2.3.2.1.1 and Figure 3-7.
+/// Serialized like jet1090's `df`: an internally tagged `"uf": "4"` string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "uf")]
 pub enum UplinkFormat {
     /// UF0: short air-air surveillance / ACAS, 56 bits.
+    #[serde(rename = "0")]
     Uf0(Uf0),
     /// UF4: surveillance altitude request, 56 bits.
+    #[serde(rename = "4")]
     Uf4(Uf4),
     /// UF5: surveillance identity request, 56 bits.
+    #[serde(rename = "5")]
     Uf5(Uf5),
     /// UF11: Mode S-only all-call, 56 bits.
+    #[serde(rename = "11")]
     Uf11(Uf11),
     /// UF16: long air-air surveillance / ACAS, 112 bits.
+    #[serde(rename = "16")]
     Uf16(Uf16),
     /// UF20: Comm-A altitude request, 112 bits.
+    #[serde(rename = "20")]
     Uf20(Uf20),
     /// UF21: Comm-A identity request, 112 bits.
+    #[serde(rename = "21")]
     Uf21(Uf21),
     /// UF24: Comm-C / extended length message, 112 bits.
+    #[serde(rename = "24")]
     Uf24(Uf24),
     /// Reserved or currently unsupported uplink format.
-    Unknown { uf: u8 },
+    #[serde(untagged)]
+    Unknown {
+        #[serde(serialize_with = "serialize_uf_string")]
+        uf: u8,
+    },
+}
+
+fn serialize_uf_string<S: serde::Serializer>(uf: &u8, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(uf)
 }
 
 impl UplinkFormat {
@@ -175,7 +192,8 @@ impl DekuReader<'_> for UplinkFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecodedUplink {
-    /// Raw demodulated frame in hexadecimal.
+    /// Raw demodulated frame in hexadecimal, serialized as `frame` (jet1090).
+    #[serde(rename = "frame")]
     pub raw: String,
 
     /// Decoded uplink payload, flattened in JSON.
@@ -311,6 +329,44 @@ mod tests {
             decode_frame(&long_uf0),
             Err(DecodeError::UfLengthMismatch { uf: 0, bits: 112 })
         ));
+    }
+
+    fn hex(s: &str) -> Option<Vec<u8>> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    #[test]
+    fn serializes_flat_jet1090_style_json() {
+        let uf4 = decode_frame(&hex("20970000b1c8a9").unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&uf4).unwrap(),
+            serde_json::json!({
+                "frame": "20970000b1c8a9", "uf": "4", "icao24": "342352",
+                "pc": 0, "rr": 18, "di": 7, "interrogator": "II0", "bds": "20",
+                "rrs": 0, "los": false, "ovc": false, "tms": 0
+            })
+        );
+        // UF11 code label 3, IC 4: SI (3-1)*16+4 = 36; IC/CL themselves are not exported.
+        let uf11 = decode_frame(&[0x58, 0xa3, 0, 0, 0x12, 0x34, 0x56]).unwrap();
+        let json = serde_json::to_value(&uf11).unwrap();
+        assert_eq!(json["uf"], "11");
+        assert_eq!(json["pr"], 1);
+        assert_eq!(json["interrogator"], "SI36");
+        assert!(json.get("ic").is_none() && json.get("cl").is_none());
+        // Long formats: byte fields are hex, Comm-A type is a flat tag.
+        let uf21 = decode_frame(&hex("a9480000cfbfff7ffff7f3123456").unwrap()).unwrap();
+        let json = serde_json::to_value(&uf21).unwrap();
+        assert_eq!(json["uf"], "21");
+        assert_eq!(json["ma"], "cfbfff7ffff7f3");
+        assert_eq!(json["comm_a"], "unknown");
+        assert!(json
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| !v.is_object() && !v.is_array()));
     }
 
     #[test]

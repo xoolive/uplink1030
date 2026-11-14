@@ -37,7 +37,7 @@
 use deku::prelude::*;
 use serde::Serialize;
 
-use crate::decode::util::Icao24;
+use crate::decode::util::{BdsCode, Icao24};
 
 /// UF0 — short air-air surveillance interrogation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
@@ -74,7 +74,14 @@ pub struct Uf0 {
     /// Data selector, Annex bits 15-22.
     ///
     /// Contains the BDS code of the GICB register requested in a DF16 reply.
+    /// Serialized as `bds` (jet1090 convention) when nonzero.
+    #[serde(skip)]
     pub ds: u8,
+
+    #[deku(skip, default = "(*ds != 0).then_some(BdsCode(*ds))")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Register requested by a nonzero `DS`, as two hex digits.
+    pub bds: Option<BdsCode>,
 
     #[deku(bits = "10")]
     #[serde(skip)]

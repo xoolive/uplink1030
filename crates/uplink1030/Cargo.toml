@@ -9,7 +9,7 @@ authors.workspace = true
 [dependencies]
 desperado.workspace = true
 rs1030 = { path = "../rs1030" }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 num-complex.workspace = true
@@ -21,6 +21,7 @@ chrono = "0.4"
 percent-encoding = "2"
 crossterm = "0.29"
 ratatui = "0.30"
+redis = { version = "1.0.4", features = ["tokio-comp"] }
 
 [features]
 default = ["file"]
@@ -28,4 +29,3 @@ file = []
 hackrf = ["desperado/hackrf"]
 soapy = ["desperado/soapy"]
 airspy = ["desperado/airspy"]
-pluto = ["desperado/pluto"]

@@ -1,133 +1,94 @@
-//! JSONL and interactive output share the same recovered messages.
-use crate::source::SourceError;
+//! JSONL recording is independent of TUI filters and replay presentation.
+use crate::{
+    activity::{Message, Model, Settings},
+    redis::Publisher,
+    source::SourceError,
+    tui::{Action, Ui},
+};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyEventKind},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Layout},
-    widgets::{Block, Paragraph, Row, Table},
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 type Screen = Terminal<CrosstermBackend<io::Stdout>>;
 
-#[derive(Default)]
-struct AircraftRow {
-    count: usize,
-    ufs: BTreeMap<u8, usize>,
-    bds: BTreeMap<String, usize>,
-    latest: Vec<String>,
+/// Preserve earlier sessions, including a final JSON record without a newline.
+struct AppendWriter {
+    inner: io::BufWriter<std::fs::File>,
+    needs_separator: bool,
 }
-
-#[derive(Default)]
-struct AircraftTable(BTreeMap<String, AircraftRow>);
-
-fn text(v: &Value) -> String {
-    if v.is_null() {
-        String::new()
-    } else {
-        v.as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| v.to_string())
-    }
-}
-
-impl AircraftTable {
-    fn observe(&mut self, uf: u8, value: &Value) {
-        let m = &value["message"];
-        let address = text(&m["icao24"]).to_ascii_lowercase();
-        let key = if uf == 11 || address == "ffffff" {
-            "*".to_owned()
-        } else {
-            address
-        };
-        let row = self.0.entry(key).or_default();
-        row.count += 1;
-        *row.ufs.entry(uf).or_default() += 1;
-        let bds = text(&m["bds"]).to_ascii_lowercase();
-        if !bds.is_empty() {
-            *row.bds.entry(bds.clone()).or_default() += 1;
+impl AppendWriter {
+    fn open(path: &str) -> io::Result<Self> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        let mut last = *b"\n";
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
         }
-        let interrogator = if uf == 11 {
-            let ic = m["ic"].as_u64().unwrap_or(0);
-            let cl = m["cl"].as_u64().unwrap_or(0);
-            if cl == 0 {
-                format!("II{ic}")
-            } else {
-                format!("SI{}", (cl - 1) * 16 + ic)
-            }
-        } else if !m["sd"]["sis"].is_null() {
-            format!("SI{}", text(&m["sd"]["sis"]))
-        } else {
-            text(&m["sd"]["iis"])
-        };
-        // Replace, rather than merge, last-message fields: absent RR/BDS/SD
-        // must clear values left by an earlier format for this aircraft.
-        row.latest = vec![
-            format!("{:.6}", value["seconds"].as_f64().unwrap_or_default()),
-            format!("UF{uf}"),
-            text(&m["rr"]),
-            bds,
-            interrogator,
-            format!(
-                "{:.3}",
-                value["decision_confidence"].as_f64().unwrap_or_default()
-            ),
-            text(&value["address_validation"]),
-            text(&m["raw"]),
-        ];
+        Ok(Self {
+            inner: io::BufWriter::new(file),
+            needs_separator: last[0] != b'\n',
+        })
     }
-
-    fn rows(&self) -> Vec<Vec<String>> {
-        let mut entries: Vec<_> = self.0.iter().collect();
-        // Keep the single all-call summary first; rank aircraft by activity.
-        // Equal counts use ICAO24 order, avoiding redraw-dependent ties.
-        entries.sort_by(|(a, ra), (b, rb)| {
-            (b.as_str() == "*")
-                .cmp(&(a.as_str() == "*"))
-                .then_with(|| rb.count.cmp(&ra.count))
-                .then_with(|| a.cmp(b))
-        });
-        entries
-            .into_iter()
-            .map(|(address, row)| {
-                let mut cells = vec![
-                    address.clone(),
-                    row.count.to_string(),
-                    row.ufs
-                        .iter()
-                        .map(|(uf, n)| format!("{uf}:{n}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    row.bds
-                        .iter()
-                        .map(|(bds, n)| format!("{bds}:{n}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ];
-                cells.extend(row.latest.clone());
-                cells
-            })
-            .collect()
+}
+impl Write for AppendWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() && self.needs_separator {
+            self.inner.write_all(b"\n")?;
+            self.needs_separator = false;
+        }
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
+fn candidate_names(candidates: &[String]) -> String {
+    let mut names: Vec<_> = candidates
+        .iter()
+        .map(|candidate| format!("{}?", candidate.split(" | ").next().unwrap_or("unknown")))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        "unknown".into()
+    } else {
+        names.join("\n")
+    }
+}
 pub struct Output {
     writer: Option<Box<dyn Write>>,
+    redis: Option<Publisher>,
+    redis_waiting: bool,
+    stopped: Arc<AtomicBool>,
     stdout_json: bool,
     pretty: bool,
     screen: Option<Screen>,
     last_draw: Instant,
-    aircraft: AircraftTable,
+    pub model: Model,
+    ui: Ui,
+    track_activity: bool,
+    sites: BTreeMap<String, Vec<String>>,
+    pub replay: bool,
+    pub paused: bool,
+    pub speed: f64,
+    pub restart: bool,
     pub counts: BTreeMap<u8, usize>,
     pub decoded: usize,
 }
@@ -144,17 +105,25 @@ impl Output {
             );
         }
         let writer = path
-            .map(|p| {
-                std::fs::File::create(p).map(|f| Box::new(io::BufWriter::new(f)) as Box<dyn Write>)
-            })
+            .map(|p| AppendWriter::open(p).map(|writer| Box::new(writer) as Box<dyn Write>))
             .transpose()?;
         let mut result = Self {
             writer,
+            redis: None,
+            redis_waiting: false,
+            stopped: Arc::new(AtomicBool::new(false)),
             stdout_json: !interactive && !stats,
             pretty,
             screen: None,
             last_draw: Instant::now() - Duration::from_secs(1),
-            aircraft: AircraftTable::default(),
+            model: Model::new(Settings::default()),
+            ui: Ui::default(),
+            track_activity: interactive,
+            sites: BTreeMap::new(),
+            replay: false,
+            paused: false,
+            speed: 1.,
+            restart: false,
             counts: BTreeMap::new(),
             decoded: 0,
         };
@@ -175,81 +144,192 @@ impl Output {
         }
         Ok(result)
     }
+    pub fn attach_redis(&mut self, publisher: Option<Publisher>, stopped: Arc<AtomicBool>) {
+        self.redis = publisher;
+        self.stopped = stopped;
+    }
+    /// Bridge the synchronous DSP/file callbacks to acknowledged asynchronous I/O.
+    /// The CLI uses Tokio's multithread runtime; block_in_place keeps its signal
+    /// and networking drivers alive. Keyboard polling remains responsive on stalls.
+    fn publish(&mut self, line: &str) -> Result<(), SourceError> {
+        let Some(mut publisher) = self.redis.take() else {
+            return Ok(());
+        };
+        let stopped = self.stopped.clone();
+        self.redis_waiting = true;
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let publication = publisher.publish(line, &stopped);
+                tokio::pin!(publication);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut publication => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            match self.poll("Redis acknowledgement pending", self.model.now-self.model.start.unwrap_or(self.model.now), false) {
+                                Ok(false) => stopped.store(true, Ordering::Relaxed),
+                                Err(error) => { stopped.store(true, Ordering::Relaxed); return Err(error); },
+                                Ok(true) => {},
+                            }
+                        },
+                    }
+                }
+            })
+        });
+        self.redis = Some(publisher);
+        self.redis_waiting = false;
+        result
+    }
+    /// Explicit final network drain. Never rely on Drop to schedule async work.
+    pub fn finish(&mut self) -> Result<(), SourceError> {
+        let redis_result: Result<(), SourceError> = if let Some(mut publisher) = self.redis.take() {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(publisher.finish())
+            })
+            .map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let file_result = self.flush();
+        file_result.and(redis_result)
+    }
+    pub fn configure(
+        &mut self,
+        settings: Settings,
+        sites: BTreeMap<String, Vec<String>>,
+        replay: bool,
+        speed: f64,
+    ) {
+        self.model = Model::new(settings);
+        self.sites = sites;
+        self.replay = replay;
+        self.speed = speed;
+        self.track_activity |= replay;
+    }
+    pub fn reset_view(&mut self) {
+        self.model = Model::new(self.model.settings.clone());
+        self.ui = Ui::default();
+    }
+    pub fn reset_activity(&mut self) {
+        self.reset_view();
+        self.counts.clear();
+        self.decoded = 0;
+        self.restart = false;
+    }
+    pub fn advance(&mut self, time: f64) {
+        if self.track_activity {
+            self.model.advance(time);
+        }
+    }
     pub fn message(&mut self, value: Value) -> Result<(), SourceError> {
-        let uf = value["message"]["type"]
+        let parsed = if self.track_activity {
+            Some(
+                Message::parse(value.clone())
+                    .map_err(|e| format!("invalid activity event: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let uf = value["uf"]
             .as_str()
-            .unwrap_or("uf?")
-            .trim_start_matches("uf")
-            .parse()
+            .and_then(|s| s.parse().ok())
             .unwrap_or(255);
         *self.counts.entry(uf).or_default() += 1;
         self.decoded += 1;
-        let line = serde_json::to_string(&value)?;
-        if let Some(writer) = self.writer.as_mut() {
-            writeln!(writer, "{line}")?;
-        }
-        if self.stdout_json {
-            let mut stdout = io::stdout().lock();
-            if self.pretty {
-                writeln!(stdout, "{}", serde_json::to_string_pretty(&value)?)?;
-            } else {
-                writeln!(stdout, "{line}")?;
+        if self.writer.is_some() || self.stdout_json || self.redis.is_some() {
+            let line = serde_json::to_string(&value)?;
+            self.publish(&line)?;
+            if let Some(w) = self.writer.as_mut() {
+                writeln!(w, "{line}")?;
+                w.flush()?;
+            }
+            if self.stdout_json {
+                let mut stdout = io::stdout().lock();
+                if self.pretty {
+                    writeln!(stdout, "{}", serde_json::to_string_pretty(&value)?)?;
+                } else {
+                    writeln!(stdout, "{line}")?;
+                }
+                stdout.flush()?;
             }
         }
-        if self.screen.is_some() {
-            self.aircraft.observe(uf, &value);
+        if let Some(m) = parsed {
+            self.model.ingest(m);
         }
         Ok(())
     }
-    pub fn poll(&mut self, source: &str, seconds: f64, force: bool) -> Result<bool, SourceError> {
+    pub fn poll(&mut self, source: &str, seconds: f64, ended: bool) -> Result<bool, SourceError> {
         if self.screen.is_none() {
             return Ok(true);
         }
+        let sites = &self.sites;
+        let names = |code: &str| {
+            sites
+                .get(code)
+                .map(|v| candidate_names(v))
+                .unwrap_or_else(|| "unknown".into())
+        };
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Esc
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    return Ok(false);
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match self.ui.key(key, &self.model, &names, self.replay) {
+                    Action::Quit => return Ok(false),
+                    Action::Pause => self.paused = !self.paused,
+                    Action::Faster => self.speed = (self.speed.max(0.125) * 2.).min(1024.),
+                    Action::Slower => self.speed = (self.speed / 2.).max(0.125),
+                    Action::Restart => self.restart = true,
+                    Action::None => (),
                 }
             }
         }
-        if force || self.last_draw.elapsed() >= Duration::from_millis(100) {
-            let counts = self
-                .counts
-                .iter()
-                .map(|(u, n)| format!("UF{u}:{n}"))
-                .collect::<Vec<_>>()
-                .join("  ");
-            let title = format!(
-                "uplink1030 | {:.3}s | {} messages | {}",
-                seconds, self.decoded, counts
+        if ended || self.last_draw.elapsed() >= Duration::from_millis(100) {
+            self.model.expire();
+            let mode = if self.redis_waiting {
+                "REDIS WAIT"
+            } else if ended {
+                "EOF"
+            } else if self.replay && self.paused {
+                "PAUSED"
+            } else if self.replay {
+                "REPLAY"
+            } else {
+                "RECEIVE"
+            };
+            let filename = std::path::Path::new(source)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(source);
+            let status = format!(
+                "{mode} {:.1}s{} | {}",
+                seconds,
+                if self.replay {
+                    format!(" {}×", self.speed)
+                } else {
+                    String::new()
+                },
+                filename
             );
-            let rows = self.aircraft.rows();
-            let uf_width = rows
-                .iter()
-                .map(|r| r[2].len())
-                .max()
-                .unwrap_or(0)
-                .clamp(9, 40) as u16;
-            let bds_width = rows
-                .iter()
-                .map(|r| r[3].len())
-                .max()
-                .unwrap_or(0)
-                .clamp(10, 64) as u16;
-            self.screen.as_mut().unwrap().draw(|frame| {
-                let areas=Layout::vertical([Constraint::Length(3),Constraint::Min(3),Constraint::Length(3)]).split(frame.area());
-                frame.render_widget(Paragraph::new(source).block(Block::bordered().title(title)),areas[0]);
-                let available=areas[1].height.saturating_sub(3) as usize;
-                let table=Table::new(rows.iter().take(available).map(|r|Row::new(r.clone())),[Constraint::Length(8),Constraint::Length(6),Constraint::Length(uf_width),Constraint::Length(bds_width),Constraint::Length(12),Constraint::Length(5),Constraint::Length(3),Constraint::Length(5),Constraint::Length(6),Constraint::Length(6),Constraint::Length(20),Constraint::Min(14)])
-                    .header(Row::new(["ICAO24","Count","UF counts","BDS counts","Last (s)","UF","RR","BDS","IIS/IC","Conf.","Address evidence","Raw"]))
-                    .block(Block::bordered().title("Aircraft activity — * all-call; counts cumulative, other fields latest; addressed messages are candidates"));
-                frame.render_widget(table,areas[1]);
-                frame.render_widget(Paragraph::new(if force {"Source ended. q / Esc to close. JSON file contains the same events."}else{"q / Esc / Ctrl-C: stop | timestamps are nominal sample-clock times, not synchronized RF reception"}).block(Block::bordered()),areas[2]);
-            })?;
+            let hints = |code: &str| {
+                sites
+                    .get(code)
+                    .map(|v| {
+                        v.iter()
+                            .map(|s| format!("Catalogue candidate: {s}"))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        vec![
+                            "No catalogue assignment candidate. Code alone cannot locate a radar."
+                                .into(),
+                        ]
+                    })
+            };
+            self.screen
+                .as_mut()
+                .unwrap()
+                .draw(|frame| self.ui.draw(frame, &self.model, &status, &names, &hints))?;
             self.last_draw = Instant::now();
         }
         Ok(true)
@@ -266,7 +346,15 @@ impl Output {
 }
 impl Drop for Output {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // Error paths still attempt a bounded drain; successful paths call finish
+        // explicitly so delivery failures can propagate to the exit status.
+        if !std::thread::panicking() {
+            if let Err(error) = self.finish() {
+                eprintln!("uplink1030: output shutdown failed: {error}");
+            }
+        } else {
+            let _ = self.flush();
+        }
         if self.screen.is_some() {
             let _ = terminal::disable_raw_mode();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
@@ -277,63 +365,13 @@ impl Drop for Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn event(address: &str, uf: u8, bds: Option<&str>, seconds: f64) -> Value {
-        json!({"message":{"icao24":address,"type":format!("uf{uf}"),"bds":bds,"rr":21,"sd":{"iis":3},"raw":"previous"},"seconds":seconds,"decision_confidence":0.97,"address_validation":"unverified"})
-    }
-
     #[test]
-    fn accumulates_counts_but_replaces_all_latest_fields() {
-        let mut table = AircraftTable::default();
-        table.observe(4, &event("39BDA4", 4, Some("0x50"), 1.));
-        table.observe(4, &event("39bda4", 4, Some("0x50"), 2.));
-        table.observe(5, &event("39bda4", 5, Some("0x60"), 3.));
-        table.observe(
-            0,
-            &json!({"message":{"icao24":"39bda4","type":"uf0","raw":"latest"},"seconds":4.}),
-        );
-        let rows = table.rows();
-        assert_eq!(rows.len(), 1);
+    fn names_list_all_candidates_without_provenance_or_claim_counts() {
+        assert_eq!(candidate_names(&[]), "unknown");
         assert_eq!(
-            &rows[0][..5],
-            ["39bda4", "4", "0:1 4:2 5:1", "0x50:2 0x60:1", "4.000000"]
+            candidate_names(&["Beta | source b".into(), "Alpha | source a".into()]),
+            "Alpha?\nBeta?"
         );
-        assert_eq!(&rows[0][5..9], ["UF0", "", "", ""]);
-        assert_eq!(rows[0][9], "0.000");
-        assert_eq!(rows[0][10], "");
-        assert_eq!(rows[0][11], "latest");
-    }
-
-    #[test]
-    fn combines_all_calls_and_ranks_aircraft_by_count() {
-        let mut table = AircraftTable::default();
-        for _ in 0..3 {
-            table.observe(4, &event("bbbbbb", 4, None, 0.));
-        }
-        table.observe(4, &event("aaaaaa", 4, None, 0.));
-        table.observe(4, &event("cccccc", 4, None, 0.));
-        table.observe(11, &json!({"message":{"icao24":"ffffff","ic":3,"cl":0}}));
-        table.observe(11, &json!({"message":{"icao24":"ffffff","ic":5,"cl":4}}));
-        let rows = table.rows();
-        assert_eq!(
-            rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
-            ["*", "bbbbbb", "aaaaaa", "cccccc"]
-        );
-        assert_eq!(&rows[0][1..4], ["2", "11:2", ""]);
-        assert_eq!(rows[0][8], "SI53");
-        table.observe(4, &event("aaaaaa", 4, None, 0.));
-        table.observe(4, &event("aaaaaa", 4, None, 0.));
-        table.observe(4, &event("aaaaaa", 4, None, 0.));
-        assert_eq!(table.rows()[1][0], "aaaaaa");
-    }
-
-    #[test]
-    fn counters_do_not_roll_off_after_two_hundred_messages() {
-        let mut table = AircraftTable::default();
-        for n in 0..250 {
-            table.observe(4, &event("39bda4", 4, Some("0x50"), n as f64));
-        }
-        assert_eq!(&table.rows()[0][1..4], ["250", "4:250", "0x50:250"]);
+        assert_eq!(candidate_names(&["Alpha | historical".into()]), "Alpha?");
     }
 }

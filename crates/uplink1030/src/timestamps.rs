@@ -75,29 +75,23 @@ impl ArrivalClock {
     }
 }
 
-pub struct EventContext<'a> {
-    pub source: &'a str,
-    pub input_rate: u32,
+pub struct EventContext {
     pub decode_rate: u32,
     pub start: Option<f64>,
-    pub basis: &'static str,
+    /// Emit demodulator diagnostics.
+    pub debug: bool,
+    /// A known-aircraft list was supplied: annotate addressed messages.
+    pub known: bool,
     pub arrivals: Option<ArrivalClock>,
 }
 
-impl EventContext<'_> {
+impl EventContext {
     pub fn reception_time(&self, decoder_sample: usize) -> Option<f64> {
         if let Some(clock) = &self.arrivals {
             clock.estimate(decoder_sample, self.decode_rate)
         } else {
             self.start
                 .map(|start| start + decoder_sample as f64 / self.decode_rate as f64)
-        }
-    }
-    pub fn reception_basis(&self) -> &'static str {
-        if self.arrivals.is_some() {
-            "host_chunk_arrival_approximate"
-        } else {
-            self.basis
         }
     }
 }
@@ -142,17 +136,14 @@ mod tests {
     #[test]
     fn file_time_is_recording_time_not_replay_wall_clock() {
         let mut ctx = EventContext {
-            source: "file",
-            input_rate: 16_000_000,
             decode_rate: 8_000_000,
             start: Some(100.),
-            basis: "sample_clock_filename_utc",
+            debug: false,
+            known: false,
             arrivals: None,
         };
         assert_eq!(ctx.reception_time(8_000_000), Some(101.));
-        assert_eq!(ctx.reception_basis(), "sample_clock_filename_utc");
         ctx.start = None;
-        ctx.basis = "relative_samples_only";
         assert!(ctx.reception_time(0).is_none());
     }
 }

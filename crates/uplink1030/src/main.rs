@@ -10,9 +10,16 @@ use std::{
         Arc,
     },
 };
+mod activity;
+mod catalogue;
+mod downlink;
 mod output;
+mod redis;
+mod replay;
+mod schema;
 mod source;
 mod timestamps;
+mod tui;
 use source::{Source, SourceError};
 use timestamps::{system_now, ArrivalClock, EventContext};
 
@@ -23,16 +30,44 @@ use timestamps::{system_now, ArrivalClock, EventContext};
 )]
 struct Args {
     /// IQ file/directory, '-' stdin, tcp://host:port or a Desperado SDR URI.
-    source: String,
+    #[arg(required_unless_present = "replay", conflicts_with = "replay")]
+    source: Option<String>,
+    /// Replay flat decoded JSONL instead of IQ (one recording per session).
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["source", "sample_rate", "decode_rate", "center_freq", "frequency_offset_hz", "format", "known_aircraft", "known_only", "seconds", "start_time", "notch_offset_hz", "debug", "no_p6_first", "no_dc_removal", "lowpass_hz", "min_confidence", "p6_min_amplitude"])]
+    replay: Option<String>,
+    /// Replay speed; 0 = unpaced, otherwise 0.125..1024 capture seconds per wall second.
+    #[arg(long, default_value = "1", requires = "replay")]
+    speed: f64,
+    /// Trailing capture-time window for displayed rates and distinct targets.
+    #[arg(long, default_value = "60")]
+    activity_window: f64,
+    /// Hide aircraft after this many capture seconds without events.
+    #[arg(long, default_value = "60")]
+    aircraft_expiry: f64,
+    /// Hide radar-code populations after this many capture seconds without events.
+    #[arg(long, default_value = "120")]
+    radar_expiry: f64,
+    /// Structured radar evidence catalogue; names/locations remain tentative.
+    #[arg(long, value_name = "PATH")]
+    catalogue: Option<String>,
     /// JSON stdout (the default); like jet1090/ship162 -v.
     #[arg(short, long, conflicts_with = "interactive")]
     verbose: bool,
     /// Interactive terminal table; q/Esc/Ctrl-C exits.
     #[arg(short,long,conflicts_with_all=["stats","pretty"])]
     interactive: bool,
-    /// JSONL file, including when the terminal table is active.
+    /// Append JSONL events to this file (created if missing), including with the TUI.
     #[arg(short, long, value_name = "PATH")]
     output: Option<String>,
+    /// Publish each compact JSON event via Redis pub/sub, awaiting server acceptance.
+    #[arg(long, value_name = "URL")]
+    redis_url: Option<String>,
+    /// Redis pub/sub topic (not a stream or list).
+    #[arg(long, default_value = "uplink1030", requires = "redis_url")]
+    redis_topic: String,
+    /// Seconds between Redis reconnect attempts; 0 warns and skips failed publications.
+    #[arg(long, default_value = "5", requires = "redis_url")]
+    redis_retry_interval: u64,
     /// Aggregate JSON statistics only.
     #[arg(long)]
     stats: bool,
@@ -85,6 +120,22 @@ struct Args {
     /// Notch an interferer at this offset from the original recording center.
     #[arg(long, allow_hyphen_values = true)]
     notch_offset_hz: Option<f32>,
+    /// Recorded jet1090 JSONL (.jsonl or .jsonl.zst) read in step with the
+    /// uplink capture clock: annotates events with what 1090 heard before them.
+    /// With a live source and --redis-url, jet1090 is followed on Redis instead.
+    #[arg(long, value_name = "PATH")]
+    downlink: Option<String>,
+    /// jet1090's topic on the --redis-url server, followed with live sources
+    /// to annotate events with what 1090 heard before them (never filters).
+    #[arg(long, default_value = "jet1090", requires = "redis_url")]
+    downlink_topic: String,
+    /// An address counts as heard on 1090 for this many seconds.
+    #[arg(long, default_value = "120")]
+    downlink_ttl: f64,
+    /// Add demodulator diagnostics to each JSON message (sample position,
+    /// detection method, symbol/sync quality, noise, emission time).
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -139,8 +190,104 @@ fn same_file(a: &str, b: &str) -> bool {
     false
 }
 
+/// `live`: the source runs in real time, so the jet1090 feed on the same
+/// Redis server describes the same moments; recordings use --downlink instead.
+async fn open_output(
+    args: &Args,
+    stopped: Arc<AtomicBool>,
+    live: bool,
+) -> Result<output::Output, SourceError> {
+    let publisher = if let Some(url) = &args.redis_url {
+        Some(tokio::select! {
+            biased;
+            _ = redis::cancelled(&stopped) => return Err("Redis connection interrupted".into()),
+            publisher = redis::Publisher::connect(url, args.redis_topic.clone(), std::time::Duration::from_secs(args.redis_retry_interval)) => publisher?,
+        })
+    } else {
+        None
+    };
+    let mut output = output::Output::new(
+        args.interactive,
+        args.output.as_deref(),
+        args.pretty,
+        args.stats,
+    )?;
+    output.attach_redis(publisher, stopped.clone());
+    if !args.downlink_ttl.is_finite() || args.downlink_ttl <= 0. {
+        return Err("--downlink-ttl must be positive".into());
+    }
+    if let Some(path) = &args.downlink {
+        let path = shellexpand::tilde(path).into_owned();
+        if args
+            .output
+            .as_ref()
+            .is_some_and(|out| same_file(&path, out))
+        {
+            return Err("output path would overwrite the downlink recording".into());
+        }
+        output.attach_downlink(downlink::Downlink::from_file(&path, args.downlink_ttl)?);
+    } else if let Some(url) = args.redis_url.as_ref().filter(|_| live) {
+        output.attach_downlink(downlink::Downlink::from_redis(
+            url,
+            args.downlink_topic.clone(),
+            args.downlink_ttl,
+            stopped,
+        )?);
+    }
+    Ok(output)
+}
+
 async fn run() -> Result<(), SourceError> {
     let args = Args::parse();
+    let settings = activity::Settings {
+        window: args.activity_window,
+        aircraft_ttl: args.aircraft_expiry,
+        radar_ttl: args.radar_expiry,
+    };
+    settings.validate()?;
+    let sites = args
+        .catalogue
+        .as_deref()
+        .map(catalogue::load)
+        .transpose()?
+        .unwrap_or_default();
+    if let (Some(catalogue), Some(output)) = (&args.catalogue, &args.output) {
+        if same_file(shellexpand::tilde(catalogue).as_ref(), output) {
+            return Err("output path would overwrite the radar catalogue".into());
+        }
+    }
+    if !args.speed.is_finite() || (args.speed != 0. && !(0.125..=1024.).contains(&args.speed)) {
+        return Err("--speed must be 0 (unpaced) or between 0.125 and 1024".into());
+    }
+    let stopped = Arc::new(AtomicBool::new(false));
+    let signal = stopped.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.store(true, Ordering::Relaxed);
+        }
+    });
+    if let Some(path) = &args.replay {
+        let path = shellexpand::tilde(path).into_owned();
+        if args
+            .output
+            .as_ref()
+            .is_some_and(|out| same_file(&path, out))
+        {
+            return Err("output path would overwrite the JSONL replay source".into());
+        }
+        // Validate input readability and its first event before creating/truncating output.
+        replay::Reader::open(&path)?.next()?;
+        let mut output = open_output(&args, stopped.clone(), false).await?;
+        output.configure(settings, sites, true, args.speed);
+        replay::run(&path, &mut output, &stopped)?;
+        let summary = serde_json::json!({"replay":path,"decoded_messages":output.decoded,"uf_counts":output.counts,"active_radar_codes":output.model.radars.len(),"active_aircraft_candidates":output.model.aircraft.len(),"unattributed_messages":output.model.unattributed,"addressed_messages_are_candidates":true});
+        output.finish()?;
+        drop(output);
+        if args.stats {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        return Ok(());
+    }
     if !args.min_confidence.is_finite()
         || !(0.0..=1.0).contains(&args.min_confidence)
         || !args.p6_min_amplitude.is_finite()
@@ -179,11 +326,12 @@ async fn run() -> Result<(), SourceError> {
         .transpose()?
         .map(|t| t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1e9);
     let mut specs = vec![];
-    if std::path::Path::new(&args.source).is_dir() {
-        collect_files(std::path::Path::new(&args.source), &mut specs)?;
+    let source_arg = args.source.as_deref().ok_or("missing IQ source")?;
+    if std::path::Path::new(source_arg).is_dir() {
+        collect_files(std::path::Path::new(source_arg), &mut specs)?;
         specs.sort();
     } else {
-        specs.push(args.source.clone());
+        specs.push(source_arg.to_owned());
     }
     if specs.is_empty() {
         return Err("no raw IQ files found".into());
@@ -205,25 +353,22 @@ async fn run() -> Result<(), SourceError> {
             }
         }
     }
-    let stopped = Arc::new(AtomicBool::new(false));
-    let signal = stopped.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.store(true, Ordering::Relaxed);
-        }
-    });
-    let mut output = output::Output::new(
-        args.interactive,
-        args.output.as_deref(),
-        args.pretty,
-        args.stats,
-    )?;
+    let live = specs
+        .iter()
+        .any(|spec| spec.parse::<Source>().is_ok_and(|s| s.is_live()));
+    let mut output = open_output(&args, stopped.clone(), live).await?;
+    output.configure(settings, sites, false, 1.);
     let mut total_samples = 0usize;
     let mut total_decoder_samples = 0usize;
     let mut resampled_sources = 0usize;
     let mut source_count = 0;
     let mut quit = false;
     for spec in &specs {
+        // Separate recordings can use unrelated UTC/relative clocks. Keep JSON totals,
+        // but never mix their rolling activity or scan histories.
+        if source_count > 0 {
+            output.reset_view();
+        }
         let mut source: Source = spec.parse()?;
         source.configure(rate, freq, format);
         if source.sample_rate < rs1030::dsp::timing::MIN_UPLINK_SAMPLE_RATE_HZ {
@@ -270,15 +415,6 @@ async fn run() -> Result<(), SourceError> {
         let start = explicit_start
             .or(source.start_timestamp)
             .or_else(|| source.is_live().then(system_now));
-        let basis = if explicit_start.is_some() {
-            "sample_clock_explicit_start"
-        } else if source.start_timestamp.is_some() {
-            "sample_clock_filename_utc"
-        } else if source.is_live() {
-            "sample_clock_system_start_approximate"
-        } else {
-            "relative_samples_only"
-        };
         let sample_rate = source.sample_rate;
         // Retain anchors through frame lookahead, timing searches and centered
         // FIR lookahead. Pruning happens after event emission, never before it.
@@ -289,11 +425,10 @@ async fn run() -> Result<(), SourceError> {
                 .as_ref()
                 .map_or(0, RationalResampler::input_lookahead);
         let mut context = EventContext {
-            source: spec,
-            input_rate: sample_rate,
             decode_rate,
             start,
-            basis,
+            debug: args.debug,
+            known: known.is_some(),
             arrivals: source
                 .is_live()
                 .then(|| ArrivalClock::new(sample_rate, retain_input)),
@@ -316,6 +451,7 @@ async fn run() -> Result<(), SourceError> {
                 }
             );
         }
+        let live = source.is_live();
         source::for_each_sample_chunk(&source, |mut chunk| {
             let arrival_time = system_now();
             let read_len = chunk.len();
@@ -345,12 +481,21 @@ async fn run() -> Result<(), SourceError> {
             };
             total_decoder_samples += decoding.len();
             for r in receiver.push(decoding, false) {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
+                }
                 emit(&mut output, r, &context)?;
             }
+            quit |= stopped.load(Ordering::Relaxed);
             if let Some(clock) = &mut context.arrivals {
                 clock.prune(samples);
             }
-            Ok(max_samples.is_none_or(|max| samples < max))
+            output.advance(if live {
+                arrival_time
+            } else {
+                start.unwrap_or(0.) + samples as f64 / sample_rate as f64
+            });
+            Ok(!quit && max_samples.is_none_or(|max| samples < max))
         })
         .await?;
         if !quit {
@@ -358,13 +503,20 @@ async fn run() -> Result<(), SourceError> {
                 let tail = resampler.push(&[], true);
                 total_decoder_samples += tail.len();
                 for r in receiver.push(&tail, false) {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
                     emit(&mut output, r, &context)?;
                 }
             }
             for r in receiver.push(&[], true) {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
+                }
                 emit(&mut output, r, &context)?;
             }
         }
+        quit |= stopped.load(Ordering::Relaxed);
         total_samples += samples;
         output.flush()?;
         if quit {
@@ -383,6 +535,7 @@ async fn run() -> Result<(), SourceError> {
         summary["decoder_samples_processed"] = total_decoder_samples.into();
         summary["resampled_sources"] = resampled_sources.into();
     }
+    output.finish()?;
     drop(output);
     if args.stats {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -393,29 +546,61 @@ async fn run() -> Result<(), SourceError> {
 fn emit(
     out: &mut output::Output,
     r: rs1030::dsp::receiver::Recovered,
-    context: &EventContext<'_>,
+    context: &EventContext,
 ) -> Result<(), SourceError> {
-    let seconds = r.detection.p6_sample as f64 / context.decode_rate as f64;
-    let reception = context.reception_time(r.detection.p6_sample);
-    let mut value = serde_json::to_value(r)?;
-    value["source"] = context.source.into();
-    value["sample_rate_hz"] = context.input_rate.into();
-    if context.decode_rate != context.input_rate {
-        value["decode_sample_rate_hz"] = context.decode_rate.into();
-        value["input_p6_sample"] = (seconds * context.input_rate as f64).into();
+    use serde_json::{Map, Value};
+    let round = |x: f64, digits: i32| {
+        let scale = 10f64.powi(digits);
+        (x * scale).round() / scale
+    };
+    let p6 = r.detection.p6_sample;
+    let seconds = p6 as f64 / context.decode_rate as f64;
+    // jet1090 convention: `timestamp` is the reception time. Live sources use
+    // host chunk arrival (the sample clock drifts with dropped samples); files
+    // use their UTC start plus sample position, else seconds since file start.
+    let timestamp = context
+        .reception_time(p6)
+        .or(context.start.map(|start| start + seconds))
+        .unwrap_or(seconds);
+    let mut value = Map::new();
+    value.insert("timestamp".into(), timestamp.into());
+    if let Value::Object(message) = serde_json::to_value(&r.message)? {
+        value.extend(message);
     }
-    value["seconds"] = seconds.into();
-    value["timestamp"] = context
-        .start
-        .map(|s| serde_json::Value::from(s + seconds))
-        .unwrap_or(serde_json::Value::Null);
-    value["timestamp_basis"] = context.basis.into();
-    value["system_timestamp"] = reception
-        .map(serde_json::Value::from)
-        .unwrap_or(serde_json::Value::Null);
-    value["system_timestamp_basis"] = context.reception_basis().into();
-    value["decoded_at"] = system_now().into();
-    out.message(value)
+    if context.known && r.address_validation != "all_call_address" {
+        value.insert(
+            "known".into(),
+            (r.address_validation == "known_address_match").into(),
+        );
+    }
+    let power = r.detection.signal_power as f64;
+    if power > 0. {
+        value.insert("rssi".into(), round(10. * power.log10(), 2).into());
+    }
+    value.insert(
+        "confidence".into(),
+        round(r.decision_confidence as f64, 3).into(),
+    );
+    if context.debug {
+        let debug = serde_json::json!({
+            "seconds": seconds,
+            "p6_sample": p6,
+            "detection_method": r.detection_method,
+            "demodulation_offset_samples": r.demodulation_offset_samples,
+            "phase_rotation_rad": r.phase_rotation_rad,
+            "symbol_coherence": r.symbol_coherence,
+            "sync_correlation": r.sync_correlation,
+            "signal_power": r.detection.signal_power,
+            "noise_mag": r.detection.noise_mag,
+            "threshold_mag": r.detection.threshold_mag,
+            "decoded_at": system_now(),
+        });
+        if let Value::Object(debug) = debug {
+            value.extend(debug);
+        }
+    }
+    schema::normalize_output(&mut value);
+    out.message(Value::Object(value))
 }
 
 struct NotchFilter {

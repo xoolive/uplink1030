@@ -21,7 +21,7 @@
 use deku::prelude::*;
 use serde::Serialize;
 
-use crate::decode::util::Icao24;
+use crate::decode::util::{serialize_hex_bytes, Icao24};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, DekuRead)]
 #[deku(ctx = "icao24: u32")]
@@ -39,7 +39,8 @@ pub struct Uf24 {
     /// Number of C-segment, Annex bits 5-8.
     pub nc: u8,
 
-    /// Comm-C message field, Annex bits 9-88.
+    /// Comm-C message field, Annex bits 9-88, as hex.
+    #[serde(serialize_with = "serialize_hex_bytes")]
     pub mc: [u8; 10],
 
     #[serde(rename = "icao24")]

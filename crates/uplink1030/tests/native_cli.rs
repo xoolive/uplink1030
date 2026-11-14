@@ -63,14 +63,25 @@ fn decoded(bytes: &[u8]) -> Vec<serde_json::Value> {
 fn assert_query(rows: &[serde_json::Value]) {
     assert!(
         rows.iter()
-            .any(|r| r["message"]["raw"] == "20a93040bfa0ad" && r["message"]["icao24"] == "39bda4"),
+            .any(|r| r["frame"] == "20a93040bfa0ad" && r["uf"] == "4" && r["icao24"] == "39bda4"),
         "{rows:?}"
     );
     for r in rows {
-        assert_eq!(
-            r["detection"]["num_bits"],
-            r["message"]["raw"].as_str().unwrap().len() * 4
+        // Protocol/header fields stay flat; reception observations form an array.
+        let object = r.as_object().unwrap();
+        assert!(
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "metadata")
+                .all(|(_, v)| !v.is_object() && !v.is_array()),
+            "{r}"
         );
+        assert_eq!(r["metadata"].as_array().unwrap().len(), 1);
+        assert_eq!(object.keys().next().unwrap(), "timestamp");
+        assert!(r["timestamp"].is_f64());
+        assert!(r["metadata"][0]["confidence"].is_f64());
+        assert!(r["metadata"][0]["rssi"].is_f64());
+        assert!(r.get("confidence").is_none() && r.get("rssi").is_none());
     }
 }
 #[test]
@@ -99,16 +110,19 @@ fn known_list_annotates_unknowns_and_known_only_filters() {
         decoded(bytes)
             .into_iter()
             .map(|mut row| {
-                row.as_object_mut().unwrap().remove("decoded_at");
+                row.as_object_mut().unwrap().remove("known");
                 row
             })
             .collect::<Vec<_>>()
     };
     assert_eq!(stable(&blind.stdout), stable(&annotated.stdout));
+    assert!(decoded(&blind.stdout)
+        .iter()
+        .all(|r| r.get("known").is_none()));
     assert_query(&decoded(&annotated.stdout));
     assert!(decoded(&annotated.stdout)
         .iter()
-        .all(|r| r["address_validation"] == "unverified"));
+        .all(|r| r["known"] == false));
     let filtered = run(true, true);
     assert!(filtered.status.success());
     assert!(filtered.stdout.is_empty());
@@ -121,9 +135,9 @@ fn known_list_annotates_unknowns_and_known_only_filters() {
         assert!(matching.status.success());
         let rows = decoded(&matching.stdout);
         assert_query(&rows);
-        assert!(rows.iter().any(|r| r["message"]["raw"] == "20a93040bfa0ad"
-            && r["address_validation"] == "known_address_match"
-            && r["validation"] == "candidate"));
+        assert!(rows
+            .iter()
+            .any(|r| r["frame"] == "20a93040bfa0ad" && r["known"] == true));
     }
 }
 
@@ -162,6 +176,7 @@ fn fractional_input_rate_resamples_and_preserves_time_coordinates() {
                 "1031M",
                 "--decode-rate",
                 decoder_rate,
+                "--debug",
             ])
             .output()
             .unwrap();
@@ -178,32 +193,38 @@ fn fractional_input_rate_resamples_and_preserves_time_coordinates() {
             } else {
                 12_000_000.
             };
-            assert_eq!(row["sample_rate_hz"], 10_000_000);
-            assert_eq!(row["decode_sample_rate_hz"].as_f64().unwrap(), decode);
             let seconds = row["seconds"].as_f64().unwrap();
-            assert!(
-                (seconds - row["detection"]["p6_sample"].as_f64().unwrap() / decode).abs() < 1e-12
-            );
-            assert!(
-                (row["input_p6_sample"].as_f64().unwrap() - seconds * 10_000_000.).abs() < 1e-9
-            );
+            assert!((seconds - row["p6_sample"].as_f64().unwrap() / decode).abs() < 1e-12);
+            // Undated file: timestamp is relative seconds since file start.
+            assert_eq!(row["timestamp"], row["seconds"]);
         }
     }
     let automatic = Command::new(env!("CARGO_BIN_EXE_uplink1030"))
         .arg(&file.0)
-        .args(["--sample-rate", "10M", "--center-freq", "1031M"])
+        .args(["--sample-rate", "10M", "--center-freq", "1031M", "--debug"])
         .output()
         .unwrap();
     assert!(automatic.status.success());
     assert_query(&decoded(&automatic.stdout));
     assert!(decoded(&automatic.stdout)
         .iter()
-        .all(|r| r["decode_sample_rate_hz"] == 8_000_000));
+        .all(
+            |r| (r["seconds"].as_f64().unwrap() - r["p6_sample"].as_f64().unwrap() / 8_000_000.)
+                .abs()
+                < 1e-12
+        ));
 
     // Short live input forces resampler/frame lookahead to flush at EOF. Its
     // reception anchor must survive the flush and still use the input clock.
     let mut child = Command::new(env!("CARGO_BIN_EXE_uplink1030"))
-        .args(["-", "--sample-rate", "10M", "--center-freq", "1031M"])
+        .args([
+            "-",
+            "--sample-rate",
+            "10M",
+            "--center-freq",
+            "1031M",
+            "--debug",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -225,13 +246,9 @@ fn fractional_input_rate_resamples_and_preserves_time_coordinates() {
     let rows = decoded(&live.stdout);
     assert_query(&rows);
     for row in rows {
-        assert_eq!(row["sample_rate_hz"], 10_000_000);
-        assert_eq!(row["decode_sample_rate_hz"], 8_000_000);
-        assert_eq!(
-            row["system_timestamp_basis"],
-            "host_chunk_arrival_approximate"
-        );
-        assert!(row["system_timestamp"].as_f64().unwrap() <= row["decoded_at"].as_f64().unwrap());
+        // Live input: host arrival time, not relative seconds.
+        let received = row["timestamp"].as_f64().unwrap();
+        assert!(received > 1e9 && received <= row["decoded_at"].as_f64().unwrap());
     }
 }
 
@@ -254,6 +271,9 @@ fn compressed_file_and_stdin_share_native_pipeline() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_query(&decoded(&result.stdout));
+    for key in ["seconds", "p6_sample", "decoded_at", "symbol_coherence"] {
+        assert!(decoded(&result.stdout).iter().all(|r| r.get(key).is_none()));
+    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_uplink1030"))
         .args(["-", "--sample-rate", "16M", "--center-freq", "1032M"])
         .stdin(Stdio::piped())
@@ -278,7 +298,7 @@ fn recording_and_emission_timestamps_are_distinct() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_uplink1030"));
         command
             .arg(&file.0)
-            .args(["--sample-rate", "16M", "--center-freq", "1032M"]);
+            .args(["--sample-rate", "16M", "--center-freq", "1032M", "--debug"]);
         if dated {
             command.args(["--start-time", "2026-10-06T10:57:07Z"]);
         }
@@ -297,8 +317,6 @@ fn recording_and_emission_timestamps_are_distinct() {
         for row in rows {
             let emitted = row["decoded_at"].as_f64().unwrap();
             assert!(before <= emitted && emitted <= after);
-            assert_eq!(row["system_timestamp"], row["timestamp"]);
-            assert_eq!(row["system_timestamp_basis"], row["timestamp_basis"]);
             if dated {
                 assert!(
                     (row["timestamp"].as_f64().unwrap()
@@ -308,7 +326,7 @@ fn recording_and_emission_timestamps_are_distinct() {
                         < 1e-6
                 );
             } else {
-                assert!(row["system_timestamp"].is_null());
+                assert_eq!(row["timestamp"], row["seconds"]);
             }
         }
     }
@@ -327,6 +345,7 @@ fn tcp_iq_and_output_file() {
         .arg(format!("tcp://{address}?rate=16M&freq=1032M"))
         .arg("--output")
         .arg(&file.0)
+        .arg("--debug")
         .output()
         .unwrap();
     sender.join().unwrap();
@@ -339,11 +358,7 @@ fn tcp_iq_and_output_file() {
     assert_query(&rows);
     assert_eq!(rows, decoded(&result.stdout));
     for row in rows {
-        assert_eq!(
-            row["system_timestamp_basis"],
-            "host_chunk_arrival_approximate"
-        );
-        let received = row["system_timestamp"].as_f64().unwrap();
+        let received = row["timestamp"].as_f64().unwrap();
         let emitted = row["decoded_at"].as_f64().unwrap();
         assert!(received <= emitted && emitted - received < 5., "{row}");
     }

@@ -1,12 +1,7 @@
 //! Bounded IQ sources. Device URI configuration is delegated to Desperado.
 //! Files (including Zstandard), stdin and TCP accept CF32/CU8/CS8/CS16.
 use desperado::IqFormat;
-#[cfg(any(
-    feature = "hackrf",
-    feature = "soapy",
-    feature = "airspy",
-    feature = "pluto"
-))]
+#[cfg(any(feature = "hackrf", feature = "soapy", feature = "airspy"))]
 use futures::StreamExt;
 use num_complex::Complex32;
 use std::{io::Read, str::FromStr};
@@ -23,12 +18,7 @@ enum Input {
     File(String),
     Stdin,
     Tcp(String, u16),
-    #[cfg(any(
-        feature = "hackrf",
-        feature = "soapy",
-        feature = "airspy",
-        feature = "pluto"
-    ))]
+    #[cfg(any(feature = "hackrf", feature = "soapy", feature = "airspy"))]
     Device(desperado::DeviceConfig),
 }
 
@@ -61,19 +51,16 @@ impl FromStr for Source {
             }
             return Ok(source);
         }
-        // Device parsers also support colon-containing Pluto USB/IP identifiers
-        // that are not valid URL authorities. Only use Url for transport sources.
+        // Device URI syntax is delegated to Desperado. Only use Url for transports.
         let scheme = spec.split_once("://").unwrap().0;
+        if scheme == "pluto" {
+            return Err("Pluto is not supported by uplink1030; use Airspy or HackRF".into());
+        }
         if scheme == "rtlsdr" {
             return Err("RTL-SDR is not supported: uplink reception requires an actual IQ sample rate of at least 8 MS/s, beyond RTL-SDR sample rates".into());
         }
         if !matches!(scheme, "file" | "stdin" | "tcp") {
-            #[cfg(any(
-                feature = "hackrf",
-                feature = "soapy",
-                feature = "airspy",
-                feature = "pluto"
-            ))]
+            #[cfg(any(feature = "hackrf", feature = "soapy", feature = "airspy"))]
             {
                 let query = spec.split_once('?').map_or("", |(_, q)| q);
                 for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
@@ -92,12 +79,7 @@ impl FromStr for Source {
                 source.input = Input::Device(normalized.parse()?);
                 return Ok(source);
             }
-            #[cfg(not(any(
-                feature = "hackrf",
-                feature = "soapy",
-                feature = "airspy",
-                feature = "pluto"
-            )))]
+            #[cfg(not(any(feature = "hackrf", feature = "soapy", feature = "airspy")))]
             return Err(format!(
                 "SDR backend '{scheme}' is not enabled; rebuild with --features {scheme}"
             )
@@ -195,12 +177,7 @@ impl Source {
         if let Some(format) = format {
             self.format = format;
         }
-        #[cfg(any(
-            feature = "hackrf",
-            feature = "soapy",
-            feature = "airspy",
-            feature = "pluto"
-        ))]
+        #[cfg(any(feature = "hackrf", feature = "soapy", feature = "airspy"))]
         if let Input::Device(config) = &mut self.input {
             match config {
                 #[cfg(feature = "hackrf")]
@@ -217,11 +194,6 @@ impl Source {
                 desperado::DeviceConfig::Airspy(c) => {
                     c.sample_rate = self.sample_rate;
                     c.center_freq = self.center_frequency;
-                }
-                #[cfg(feature = "pluto")]
-                desperado::DeviceConfig::Pluto(c) => {
-                    c.sample_rate = self.sample_rate as i64;
-                    c.center_freq = self.center_frequency as i64;
                 }
             }
         }
@@ -348,12 +320,7 @@ pub async fn for_each_sample_chunk(
                 }
             }
         }
-        #[cfg(any(
-            feature = "hackrf",
-            feature = "soapy",
-            feature = "airspy",
-            feature = "pluto"
-        ))]
+        #[cfg(any(feature = "hackrf", feature = "soapy", feature = "airspy"))]
         Input::Device(config) => {
             let mut stream = desperado::IqAsyncSource::from_device_config(config).await?;
             let run_result: Result<(), SourceError> = async {
@@ -376,6 +343,32 @@ pub async fn for_each_sample_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pluto_uris_are_explicitly_unsupported() {
+        for uri in [
+            "pluto://",
+            "pluto://ip:192.168.2.1",
+            "pluto://usb:1.2.3?rate=10M",
+        ] {
+            let error = uri.parse::<Source>().unwrap_err().to_string();
+            assert!(error.contains("Pluto is not supported"));
+            assert!(!error.contains("rebuild"));
+        }
+    }
+    #[cfg(feature = "airspy")]
+    #[test]
+    fn airspy_overrides_reconfigure_hardware() {
+        let mut s: Source = "airspy://0?freq=1030M&rate=10M".parse().unwrap();
+        assert_eq!(s.sample_rate, 10_000_000);
+        s.configure(Some(8_000_000), Some(1_032_000_000), None);
+        match s.input {
+            Input::Device(desperado::DeviceConfig::Airspy(c)) => {
+                assert_eq!(c.sample_rate, 8_000_000);
+                assert_eq!(c.center_freq, 1_032_000_000);
+            }
+            _ => panic!(),
+        }
+    }
     #[test]
     fn rtl_sdr_uri_reports_unsupported_rate() {
         let error = "rtlsdr://0?freq=1030M&rate=2.4M"
